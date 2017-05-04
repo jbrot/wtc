@@ -32,9 +32,13 @@
  *
  * Every function which changes the state of the wtc_tmux object has an int
  * return value. 0 means the operation was successful whereas a negative value
- * indicates an error occurred. See individual functions for the specific error
- * codes.
+ * indicates an error occurred. See individual functions for the specific 
+ * error codes.
  */
+
+#include <stdbool.h>
+
+#include "uthash.h"
 
 struct wtc_tmux;
 struct wtc_tmux_window;
@@ -56,8 +60,8 @@ struct wtc_tmux_pane
 	 */
 	int pid;
 	/* 
-	 * Whether or not this is the active pane in its window. Only one pane will
-	 * be active in a window.
+	 * Whether or not this is the active pane in its window. Only one pane 
+	 * will be active in a window.
 	 */
 	bool active;
 
@@ -75,21 +79,25 @@ struct wtc_tmux_pane
 
 	/*
 	 * The pane's extents within the window. The origin is the top-left
-	 * corner of the display. Positive x is to the right and positive y is down.
-	 * Note that the status bar is not accounted for by these coordinates.
+	 * corner of the display. Positive x is to the right and positive y is 
+	 * down.  Note that the status bar is not accounted for by these 
+	 * coordinates.
 	 */
 	int x;
 	int y;
 	int w;
 	int h;
+
+	/* So we can be in a hash map. */
+	UT_hash_handle hh;
 };
 
 /*
- * Describes a tmux window. A window represents the full screen being shown to a
- * session and is comprised of multiple panes which handle the actual content. 
- * A window is associated with a unique session group but not necessarily a 
- * unique session. wtc_tmux_windows constitute a doubly linked list which 
- * contain the windows associated with a given session group.
+ * Describes a tmux window. A window represents the full screen being shown to
+ * a session and is comprised of multiple panes which handle the actual 
+ * content. A window is associated with a unique session group but not 
+ * necessarily a unique session. wtc_tmux_windows constitute a doubly linked 
+ * list which contain the windows associated with a given session group.
  */
 struct wtc_tmux_window
 {
@@ -97,10 +105,10 @@ struct wtc_tmux_window
 	int id;
 
 	/* 
-	 * The adjacent windows in the linked list. These windows are guaranteed to
-	 * be in the same session group, but there is no guarantee on the specifics
-	 * of the order. These will be NULL if this is the first or last window in 
-	 * the list respectively.
+	 * The adjacent windows in the linked list. These windows are guaranteed 
+	 * to be in the same session group, but there is no guarantee on the 
+	 * specifics of the order. These will be NULL if this is the first or last
+	 * window in the list respectively.
 	 */
 	struct wtc_tmux_window *previous;
 	struct wtc_tmux_window *next;
@@ -114,6 +122,9 @@ struct wtc_tmux_window
 	 * you can use this to iterate through all of the linked panes.
 	 */
 	struct wtc_tmux_pane *panes;
+
+	/* So we can be in a hash map. */
+	UT_hash_handle hh;
 };
 
 /*
@@ -127,21 +138,12 @@ struct wtc_tmux_window
  * session it is associated with as well. Thus, unlike with panes, 
  * wtc_tmux_window does not have an active property. To determine if a window
  * is active with respect to a session, check if it is the window pointed to
- * by active_window. wtc_tmux_sessions constitute a doubly linked list of all
- * of the sessions connected to the server.
+ * by active_window. 
  */
 struct wtc_tmux_session
 {
 	/* The session's tmux id. */
 	int id;
-
-	/* 
-	 * The adjacent sesions in the linked list. The order is arbitrary. These 
-	 * will be NULL if this is the first or last client in the list 
-	 * respectively.
-	 */
-	struct wtc_tmux_session *previous;
-	struct wtc_tmux_session *next;
 
 	/* The window this session is currently viewing. */
 	struct wtc_tmux_window *active_window;
@@ -156,18 +158,22 @@ struct wtc_tmux_session
 
 	/*
 	 * The first client linked with this session. Using wtc_tmux_client->next 
-	 * you can iterate through all of the clients associated with this session.
+	 * you can iterate through all of the clients associated with this 
+	 * session.
 	 */
-	struct wtc_tmux_Client *clients;
+	struct wtc_tmux_client *clients;
+
+	/* So we can be in a hash map. */
+	UT_hash_handle hh;
 };
 
 /*
- * Descrives a tmux client. A client represents an instance of the tmux process
- * which has connenected to the server. A client is associated with a unique
- * session and is shown the active window on that session. Every client linked
- * to a given session receives the same content. wtc_tmux_clients constitute
- * a doubly linked list which compruises the clients attached to a specific
- * session.
+ * Describes a tmux client. A client represents an instance of the tmux 
+ * process which has connected to the server. A client is associated with a 
+ * unique session and is shown the active window on that session. Every client
+ * linked to a given session receives the same content. wtc_tmux_clients
+ * constitute a doubly linked list which compruises the clients attached to a 
+ * specific session.
  */
 struct wtc_tmux_client
 {
@@ -179,17 +185,20 @@ struct wtc_tmux_client
 	/* The client's attached session. */
 	struct wtc_tmux_session *session;
 	/* 
-	 * The adjacent clients in the linked list. These clients are guaranteed to
-	 * be attached to the same session, but their order is arbitrary. These 
-	 * will be NULL if this is the first or last client in the list 
+	 * The adjacent clients in the linked list. These clients are guaranteed
+	 * to be attached to the same session, but their order is arbitrary.
+	 * These will be NULL if this is the first or last client in the list 
 	 * respectively.
 	 */
 	struct wtc_tmux_client *previous;
 	struct wtc_tmux_client *next;
+
+	/* So we can be in a hash map. */
+	UT_hash_handle hh;
 };
 
 /*
- * Create a new wtc_tmux object.
+ * Create a new wtc_tmux object. This can fail with -ENOMEM.
  */
 int wtc_tmux_new(struct wtc_tmux **out);
 /*
@@ -205,14 +214,26 @@ void wtc_tmux_unref(struct wtc_tmux *tmux);
 /*
  * The following functions describe how the tmux binary will be launched
  * to properly connect to the server. If the wtc_tmux object is currently
- * connected, the write functions will have no effect.
+ * connected, the write functions will fail with -EBUSY and have no effect.
  */
 
 /*
  * bin_file is the tmux binary file. It defaults to "/usr/bin/tmux". This file
  * will be launched with exec. This binary is not verified, so it is very
  * important that the correct binary is specified as this can be used to
- * perform arbitrary code execution.
+ * perform arbitrary code execution. 
+ *
+ * bin_file will initially be set to NULL at object creation and may be NULL
+ * when the object is not connected. A NULL value indicates that the default
+ * value is to be used, and it will be filled in during connection. If the
+ * wtc_tmux object is connected, bin_file is guaranteed to be not NULL.
+ *
+ * The string provided will be copied into the internal structure. -EINVAL
+ * will be returned if the tmux object is NULL, and -ENOMEM will be returned
+ * if the string could not be duplicated.
+ *
+ * Passing NULL to wtc_tmux_get_bin_file is an error and will result in NULL
+ * being dereferenced.
  */
 int wtc_tmux_set_bin_file(struct wtc_tmux *tmux, const char *path);
 const char *wtc_tmux_get_bin_file(const struct wtc_tmux *tmux);
@@ -222,33 +243,49 @@ const char *wtc_tmux_get_bin_file(const struct wtc_tmux *tmux);
  * the "-S" option. See tmux documentation for details. Setting one of these 
  * values to a non-NULL value will cause the other to be set to NULL. 
  * wtc_tmux_is_socket_set will report if either value is non-NULL.
+ *
+ * The string provided will be copied into the internal structure. -EINVAL
+ * will be returned if the tmux object is NULL, and -ENOMEM will be returned
+ * if the string could not be duplicated.
+ *
+ * Passing NULL to wtc_tmux_get_socket_name, wtc_tmux_get_socket_path, or
+ * wtc_tmux_is_socket_set is an error and will result in NULL being 
+ * dereferenced.
  */
 int wtc_tmux_set_socket_name(struct wtc_tmux *tmux, const char *name);
 int wtc_tmux_set_socket_path(struct wtc_tmux *tmux, const char *path);
 const char *wtc_tmux_get_socket_name(const struct wtc_tmux *tmux);
 const char *wtc_tmux_get_socket_path(const struct wtc_tmux *tmux);
-bool wtc_tmux_is_socket_set(const struct wtc_tumx *tmux);
+bool wtc_tmux_is_socket_set(const struct wtc_tmux *tmux);
 
 /*
  * This corresponds to the "-f" option. See tmux documentation for details.
+ *
+ * The string provided will be copied into the internal structure. -EINVAL
+ * will be returned if the tmux object is NULL, and -ENOMEM will be returned
+ * if the string could not be duplicated.
+ *
+ * Passing NULL to wtc_tmux_get_config_file is an error and will result in 
+ * NULL being dereferenced.
  */
-int wtc_tmux_set_config_file(struct wtc_tmux *tmux, const char *fil);
+int wtc_tmux_set_config_file(struct wtc_tmux *tmux, const char *file);
 const char *wtc_tmux_get_config_file(const struct wtc_tmux *tmux);
 
 /*
  * These functions start and stop the interactions with tmux. The details
- * for how the tmux connection will be configured can be set using the previous
- * functions. Once wtc_tmux_connect has been called successfully, they will
- * have no effect until after wtc_tmux_disconnect has been called successfully.
- * Both of these functions are synchronous and respect the timeout value.
+ * for how the tmux connection will be configured can be set using the
+ * previous functions. Once wtc_tmux_connect has been called successfully,
+ * they will have no effect until after wtc_tmux_disconnect has been called
+ * successfully. Both of these functions are synchronous and respect the
+ * timeout value.
  *
  * When wtc_tmux_connect is called, a list of all of the currently running
  * sessions is retrieved from the server. Then a control mode client is
  * attached to each one in order to properly track the entire server.
  * In the event that no sessions are running, a temporary session called
  * "wtc_tmux" will be created. When tmux reports that another session has
- * been created, this session will be terminated (provided that no other client
- * has attached to it).
+ * been created, this session will be terminated (provided that no other
+ * client has attached to it).
  *
  * wtc_tmux_disconnect terminates all of the connections to the server. In the
  * event that the "wtc_tmux" session is open and no one else is connected to 
@@ -267,27 +304,40 @@ bool wtc_tmux_is_connected(const struct wtc_tmux *tmux);
 /*
  * The timeout value, set in milliseconds, defaults to 10,000. This is the
  * maximum amount of time that will be waited for any synchronous operation
- * before failing due to lack of response.
+ * before failing due to lack of response. A value of 0 indicates there is
+ * to be no timeout. -EINVAL will be returned if the tmux object is NULL.
+ *
+ * Passing NULL to wtc_tmux_get_timeout is an error and will result in 
+ * NULL being dereferenced.
  */
-int wtc_tmux_set_timeout(struct wtc_tmux *tmux, int timeout);
-int wtc_tmux_get_timeout(const struct wtc_tmux *tmux);
+int wtc_tmux_set_timeout(struct wtc_tmux *tmux, unsigned int timeout);
+unsigned int wtc_tmux_get_timeout(const struct wtc_tmux *tmux);
 
 /*
  * The size of the control session defaults to 80x24. Note that each window's 
  * dimensions are capped to that of the smallest connected client, so
- * this value should be large enought that the clients' windows are
+ * this value should be large enough that the clients' windows are
  * unrestricted. However, very large values can have significant memory
  * ramifications, so don't make these values too ridiculous.
+ *
+ * -EINVAL will be returned if tmux is NULL or either w or h are less than
+ *  10. If the tmux object is currently connected then calling
+ *  wtc_tmux_set_size will synchronously change the size of all of the
+ *  attached clients, respecting the timeout setting (provided a new size has 
+ *  been set).
+ *
+ * Passing NULL to wtc_tmux_get_width or wtc_tmux_get_height is an error and
+ * will result in NULL being dereferenced.
  */
-int wtc_tmux_set_size(struct wtc_tmux *tmux, int w, int h);
-int wtc_tmux_get_width(const struct wtc_tmux *tmux);
-int wtc_tmux_get_height(const struct wtc_tmux *tmux);
+int wtc_tmux_set_size(struct wtc_tmux *tmux, unsigned int w, unsigned int h);
+unsigned int wtc_tmux_get_width(const struct wtc_tmux *tmux);
+unsigned int wtc_tmux_get_height(const struct wtc_tmux *tmux);
 
 /*
  * The following callbacks will be invoked in response to various changes
  * in the tmux server. They are the primary way of reacting to the server
- * state. These should all probably be configured before connenection, although
- * they may be configured afterwards.
+ * state. These should all probably be configured before connenection,
+ * although they may be configured afterwards.
  *
  * All callbacks are reactive, that is they happen after the event they are
  * in response to has fully completed. The destruction callbacks are called
@@ -300,11 +350,11 @@ int wtc_tmux_set_client_session_changed_cb(struct wtc_tmux *tmux,
 	void (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_client *client));
 
 int wtc_tmux_set_new_session_cb(struct wtc_tmux *tmux, 
-	void (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_session *session));
+	void (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_session *sess));
 int wtc_tmux_set_session_closed_cb(struct wtc_tmux *tmux, 
-	void (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_session *session));
+	void (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_session *sess));
 int wtc_tmux_set_session_window_changed_cb(struct wtc_tmux *tmux, 
-	void (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_session *session));
+	void (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_session *sess));
 
 int wtc_tmux_set_new_window_cb(struct wtc_tmux *tmux, 
 	void (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_window *window));
@@ -332,10 +382,10 @@ const struct wtc_tmux_session *
 wtc_tmux_lookup_session(const struct wtc_tmux *tmux, int id);
 
 const struct wtc_tmux_window *
-wtc_tmux_lookup_window(const struct wtc_tmux *tmux int id);
+wtc_tmux_lookup_window(const struct wtc_tmux *tmux, int id);
 
 const struct wtc_tmux_pane *
-wtc_tmux_lookup_pane(const struct wtc_tmux *tmux int id);
+wtc_tmux_lookup_pane(const struct wtc_tmux *tmux, int id);
 
 /*
  * Get the first session in the linked list associated with this tmux object.
