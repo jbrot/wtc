@@ -589,11 +589,119 @@ done:
 	return r;
 }
 
+/*
+ * Update the information on the sessions' status bar.
+ */
+static int update_session_status(struct wtc_tmux *tmux,
+                                 struct wtc_tmux_session *sess, 
+                                 bool gstatus, bool gstop)
+{
+	return -1;
+}
+
+/*
+ * Reload the entire model of the tmux server.
+ */
+static int reload_structure(struct wtc_tmux *tmux)
+{
+	int r = 0;
+	// First, establish the list of sessions.
+	const char *const cmd[] = { "list-sessions", "-F", "#{session_id}",
+	                            NULL };
+	char *out = NULL;
+	r = exec_tmux(tmux, cmd, &out, NULL);
+	if (r < 0)
+		goto err_out;
+
+	// First, estimate the session count by number of lines
+	// (if there aren't any sessions, this will over count)
+	int count = 0;
+	for (int i = 0; out[i]; ++i)
+		count += out[i] == '\n';
+
+	int *sids = calloc(count, sizeof(int));
+	if (!sids) {
+		r = -ENOMEM;
+		goto err_out;
+	}
+
+	count = 0;
+	char *svptr = NULL;
+	char *pos = strtok_r(out, "\n", &svptr);
+	int linec = 0;
+	while (pos != NULL) {
+		r = sscanf(pos, "$%u%n", &sids[count], &linec);
+		if (r != 1 || linec != strlen(pos)) { // Parse error
+			r = -EINVAL;
+			goto err_sids;
+		}
+
+		count++;
+		pos = strtok_r(NULL, "\n", &svptr);
+	}
+
+	// We now need to synchronize the sessions list in the tmux object
+	// with the actual sessions list.
+	struct wtc_tmux_session *sess, *tmp;
+	HASH_ITER(hh, tmux->sessions, sess, tmp) {
+		for (int i = 0; i < count; ++i) {
+			if (sess->id == sids[i]) {
+				sids[i] = -1;
+				goto icont;
+			}
+		}
+
+		HASH_DEL(tmux->sessions, sess);
+		free(sess); // TODO possible ref count?
+
+		icont: ;
+	}
+
+	for (int i = 0; i < count; ++i) {
+		if (sids[i] == -1)
+			continue;
+
+		sess = calloc(1, sizeof(struct wtc_tmux_session));
+		if (!sess) {
+			// In an ideal world, we'd make all the changes to a temp copy
+			// so that the state is unaffected in the even of failure.
+			// However, that's way too much work in this case and since the
+			// error is OOM, there's not really much hope for recovery so
+			// it's not that big of a deal.
+			r = -ENOMEM;
+			goto err_sids;
+		}
+		sess->id = sids[i];
+		HASH_ADD_INT(tmux->sessions, id, sess);
+	}
+
+	bool gstatus = true;
+	bool gstop = true;
+	if (count) {
+		// TODO update gstatus and gstop
+	}
+
+	for (sess = tmux->sessions; sess; sess = sess->hh.next) {
+		r = update_session_status(tmux, sess, gstatus, gstop);
+		if (r < 0)
+			// In this case, the error might be something recoverable and
+			// we've just gone and mucked things up pretty badly, but
+			// what can you do?
+			goto err_sids;
+	}
+
+err_sids:
+	free(sids);
+err_out:
+	free(out);
+	return r;
+}
+
 int wtc_tmux_connect(struct wtc_tmux *tmux)
 {
 	int r = 0;
 
-	if (!tmux)
+	if (!tmux || tmux->connected)
 		return -EINVAL;
 
 	r = update_cmd(tmux);
@@ -614,11 +722,7 @@ int wtc_tmux_connect(struct wtc_tmux *tmux)
 		return r;
 	}
 
-	const char *const cmd[] = { "list-windows", NULL };
-	char *out = NULL;
-	r = exec_tmux(tmux, cmd, &out, NULL);
-	if (!r)
-		printf("%s", out);
+	r = reload_structure(tmux);
 	return r;
 }
 

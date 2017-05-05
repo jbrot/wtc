@@ -145,6 +145,15 @@ struct wtc_tmux_session
 	/* The session's tmux id. */
 	int id;
 
+	/*
+	 * The position of the staus bar for this session. Either
+	 * WTC_TMUX_SESSION_TOP, WTC_TMUX_SESSION_BOTTOM, or WTC_TMUX_SESSION_OFF.
+	 */
+	int statusbar;
+#define WTC_TMUX_SESSION_OFF 0
+#define WTC_TMUX_SESSION_TOP 1
+#define WTC_TMUX_SESSION_BOTTOM 2
+
 	/* The window this session is currently viewing. */
 	struct wtc_tmux_window *active_window;
 	/* The number of windows linked to this session. */
