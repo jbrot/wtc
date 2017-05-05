@@ -30,6 +30,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <wait.h>
@@ -82,6 +83,43 @@ struct wtc_tmux {
 
 	struct wtc_tmux_cbs cbs;
 };
+
+/*
+ * Dynamically allocate memory for the specified printf operation and
+ * then store the result in it. Returns 0 on success and negative error
+ * value. out must be non-NULL while *out must be NULL.
+ */
+__attribute__((format (printf, 2, 3)))
+static int bprintf(char **out, const char *format, ...)
+{
+	va_list args;
+	char *buf;
+	int flen;
+
+	if (!out || *out)
+		return -EINVAL;
+
+	va_start(args, format);
+	flen = vsnprintf(NULL, 0, format, args);
+	va_end(args);
+
+	if (flen < 0)
+		return flen;
+
+	buf = malloc(flen + 1);
+	if (!buf)
+		return -ENOMEM;
+
+	va_start(args, format);
+	flen = vsnprintf(buf, flen + 1, format, args);
+	va_end(args);
+
+	if (flen < 0)
+		return flen;
+
+	*out = buf;
+	return 0;
+}
 
 /*
  * Fork a tmux process. cmds will be appended to tmux->cmds to produce the
@@ -151,14 +189,18 @@ static int fork_tmux(struct wtc_tmux *tmux, const char *const *cmds,
 		}
 	}
 
+	// TODO: Logging
+	for (int i = 0; exc[i]; ++i) printf("%s ", exc[i]);
+	printf("\n");
+
 	pid_t cpid = fork();
 	if (cpid == -1) {
 		r = -errno;
 		goto err_perr;
 	} else if (cpid == 0) { // Child
-		if ((!fin  || dup2(pin[0],  STDIN_FILENO)  != STDIN_FILENO) &&
-		    (!fout || dup2(pout[1], STDOUT_FILENO) != STDOUT_FILENO) &&
-		    (!ferr || dup2(perr[1], STDERR_FILENO) != STDERR_FILENO)) {
+		if ((fin  && dup2(pin[0],  STDIN_FILENO)  != STDIN_FILENO)  ||
+		    (fout && dup2(pout[1], STDOUT_FILENO) != STDOUT_FILENO) ||
+		    (ferr && dup2(perr[1], STDERR_FILENO) != STDERR_FILENO)) {
 			int err = errno;
 			fprintf(stderr, "Could not change stdio file descriptors!");
 			_exit(err);
@@ -204,7 +246,7 @@ err_pin:
 		close(pin[1]);
 	}
 err_exc:
-	for (int i = 0; i < len; i++)
+	for (int i = 0; i < len; ++i)
 		free(exc[i]);
 	free(exc);
 	return r;
@@ -242,7 +284,7 @@ static int read_full(int fd, char **out)
 	}
 
 	pos += r;
-	memset(buf + pos, 0, len + 1 - pos);
+	memset(buf + pos, '\0', len + 1 - pos);
 
 	*out = buf;
 	return 0;
@@ -287,10 +329,20 @@ static int exec_tmux(struct wtc_tmux *tmux, const char *const *cmds,
 	if (!pid)
 		return r;
 
-	if (waitpid(pid, NULL, 0) != pid || r) {
+	int status = 0;
+	if (waitpid(pid, &status, 0) != pid || r) {
 		r = r ? r : -errno;
 		goto err_fds;
 	}
+	if (!WIFEXITED(status)) {
+		// TODO: Logging
+		printf("Child didn't exit!\n");
+		r = -EINVAL;
+		goto err_fds;
+	}
+	r = -WEXITSTATUS(status);
+	if (r < 0)
+		goto err_fds;
 
 	if (out) {
 		r = read_full(fout, out);
@@ -306,6 +358,66 @@ err_fds:
 		r = -errno;
 	if (err && close(ferr) && !r)
 		r = -errno;
+	return r;
+}
+
+/*
+ * Retrieve the value of the option specified by name. The trailing newline
+ * will be omitted in *out. Mode can be a bitwise or of several of the
+ * gollowing flags. If the global or server flags are set, then target is
+ * ignored. If the session flag is set, then target will be used to determine
+ * which session to query and likewise for the window flag.
+ *
+ * Note that out must be non-NULL and *out must be NULL.
+ */
+#define WTC_TMUX_OPTION_LOCAL   0
+#define WTC_TMUX_OPTION_GLOBAL  1<<0
+#define WTC_TMUX_OPTION_WINDOW  0
+#define WTC_TMUX_OPTION_SESSION 1<<1
+#define WTC_TMUX_OPTION_SERVER  1<<2 
+static int get_option(struct wtc_tmux *tmux, const char *name, 
+                      int target, int mode, char **out)
+{
+	int r = 0;
+	if (!tmux || !out || *out)
+		return -EINVAL;
+
+	int i = 0;
+	const char *cmd[] = { "show-options", NULL, NULL, NULL, NULL };
+	char *dyn = NULL;
+	if (mode & WTC_TMUX_OPTION_SERVER) {
+		cmd[++i] = "-vs";
+	} else if (mode & WTC_TMUX_OPTION_SESSION) {
+		if (mode & WTC_TMUX_OPTION_GLOBAL) {
+			cmd[++i] = "-vg";
+		} else {
+			cmd[++i] = "-vt";
+			r = bprintf(&dyn, "$%u", target);
+			if (r < 0)
+				return r;
+			cmd[++i] = dyn;
+		}
+	} else { // WTC_TMUX_OPTION_WINDOW
+		if (mode & WTC_TMUX_OPTION_GLOBAL) {
+			cmd[++i] = "-vwg";
+		} else {
+			cmd[++i] = "-vwgt";
+			r = bprintf(&dyn, "@%u", mode);
+			if (r < 0)
+				return r;
+			cmd[++i] = dyn;
+		}
+	}
+	cmd[++i] = name;
+
+	r = exec_tmux(tmux, cmd, out, NULL);
+	if (*out) {
+		int l = strlen(*out);
+		if ((*out)[l - 1] == '\n')
+			(*out)[l - 1] = '\0';
+	}
+
+	free(dyn);
 	return r;
 }
 
@@ -479,74 +591,6 @@ const char *wtc_tmux_get_config_file(const struct wtc_tmux *tmux)
 	return tmux->config;
 }
 
-static int update_cmd(struct wtc_tmux *tmux)
-{
-	int i = 0;
-	int r = 0;
-
-	int cmdlen = 1 + (wtc_tmux_is_socket_set(tmux) ? 2 : 0)
-	               + (tmux->config ? 2 : 0);
-
-	char **cmd = calloc(cmdlen, sizeof(char *));
-	if (!cmd)
-		return -ENOMEM;
-
-	if (!tmux->bin) {
-		tmux->bin = strdup("/usr/bin/tmux");
-		if (!tmux->bin) {
-			r = -ENOMEM;
-			goto err_cmd;
-		}
-	}
-	cmd[i] = tmux->bin;
-
-	if (wtc_tmux_is_socket_set(tmux)) {
-		if (tmux->socket) {
-			cmd[++i] = strdup("-L");
-			if (!cmd[i]) {
-				r = -ENOMEM;
-				goto err_cmd;
-			}
-			cmd[++i] = tmux->socket;
-		} else {
-			cmd[++i] = strdup("-S");
-			if (!cmd[i]) {
-				r = -ENOMEM;
-				goto err_cmd;
-			}
-			cmd[++i] = tmux->socket_path;
-		}
-	}
-
-	if (tmux->config) {
-		cmd[++i] = strdup("-f");
-		if (!cmd[i]) {
-			r = -ENOMEM;
-			goto err_cmd;
-		}
-		cmd[++i] = tmux->config;
-	}
-
-	assert(i + 1 == cmdlen);
-
-	for (i = 0; i < tmux->cmdlen; ++i)
-		if (cmd_freeable(tmux, tmux->cmd[i]))
-			free(tmux->cmd[i]);
-	free(tmux->cmd);
-
-	tmux->cmd = cmd;
-	tmux->cmdlen = cmdlen;
-
-	return r;
-
-err_cmd:
-	for (i = 0; i < cmdlen; ++i)
-		if (cmd_freeable(tmux, cmd[i]))
-			free(cmd[i]);
-	free(cmd);
-	return r;
-}
-
 /*
  * Ensures the version of tmux is new enough to support the needed messages.
  * Returns 1 if the versions is new enough and 0 if it is not. Will return
@@ -596,7 +640,46 @@ static int update_session_status(struct wtc_tmux *tmux,
                                  struct wtc_tmux_session *sess, 
                                  bool gstatus, bool gstop)
 {
-	return -1;
+	int r = 0;
+	char *out = NULL;
+	bool status, top;
+
+	r = get_option(tmux, "status", sess->id, WTC_TMUX_OPTION_SESSION, &out);
+	if (r < 0)
+		goto err_out;
+	if (strncmp(out, "on", 2) == 0) {
+		status = true;
+	} else if (strncmp(out, "off", 3) == 0) {
+		status = false;
+	} else if (strcmp(out, "") == 0) {
+		status = gstatus;
+	} else {
+		r = -EINVAL;
+		goto err_out;
+	}
+
+	free(out); out = NULL;
+	r = get_option(tmux, "status-position", sess->id, 
+	               WTC_TMUX_OPTION_SESSION, &out);
+	if (r < 0)
+		goto err_out;
+	if (strncmp(out, "top", 3) == 0) {
+		top = true;
+	} else if (strncmp(out, "bottom", 6) == 0) {
+		top = false;
+	} else if (strcmp(out, "") == 0) {
+		top = gstop;
+	} else {
+		r = -EINVAL;
+		goto err_out;
+	}
+
+	sess->statusbar = !status ? WTC_TMUX_SESSION_OFF : 
+	                   top ? WTC_TMUX_SESSION_TOP : WTC_TMUX_SESSION_BOTTOM;
+
+err_out:
+	free(out);
+	return r;
 }
 
 /*
@@ -677,8 +760,37 @@ static int reload_structure(struct wtc_tmux *tmux)
 
 	bool gstatus = true;
 	bool gstop = true;
+	printf("count: %d\n", count);
 	if (count) {
-		// TODO update gstatus and gstop
+		free(out); out = NULL;
+		r = get_option(tmux, "status", 0, 
+		               WTC_TMUX_OPTION_GLOBAL | WTC_TMUX_OPTION_SESSION,
+		               &out);
+		if (r < 0)
+			goto err_sids;
+		if (strncmp(out, "on", 2) == 0) {
+			gstatus = true;
+		} else if (strncmp(out, "off", 3) == 0) {
+			gstatus = false;
+		} else {
+			r = -EINVAL;
+			goto err_sids;
+		}
+
+		free(out); out = NULL;
+		r = get_option(tmux, "status-position", 0, 
+		               WTC_TMUX_OPTION_GLOBAL | WTC_TMUX_OPTION_SESSION,
+		               &out);
+		if (r < 0)
+			goto err_sids;
+		if (strncmp(out, "top", 3) == 0) {
+			gstop = true;
+		} else if (strncmp(out, "bottom", 6) == 0) {
+			gstop = false;
+		} else {
+			r = -EINVAL;
+			goto err_sids;
+		}
 	}
 
 	for (sess = tmux->sessions; sess; sess = sess->hh.next) {
@@ -688,12 +800,82 @@ static int reload_structure(struct wtc_tmux *tmux)
 			// we've just gone and mucked things up pretty badly, but
 			// what can you do?
 			goto err_sids;
+
+		printf("$%u -- %u\n", sess->id, sess->statusbar);
 	}
 
 err_sids:
 	free(sids);
 err_out:
 	free(out);
+	return r;
+}
+
+static int update_cmd(struct wtc_tmux *tmux)
+{
+	int i = 0;
+	int r = 0;
+
+	int cmdlen = 1 + (wtc_tmux_is_socket_set(tmux) ? 2 : 0)
+	               + (tmux->config ? 2 : 0);
+
+	char **cmd = calloc(cmdlen, sizeof(char *));
+	if (!cmd)
+		return -ENOMEM;
+
+	if (!tmux->bin) {
+		tmux->bin = strdup("/usr/bin/tmux");
+		if (!tmux->bin) {
+			r = -ENOMEM;
+			goto err_cmd;
+		}
+	}
+	cmd[i] = tmux->bin;
+
+	if (wtc_tmux_is_socket_set(tmux)) {
+		if (tmux->socket) {
+			cmd[++i] = strdup("-L");
+			if (!cmd[i]) {
+				r = -ENOMEM;
+				goto err_cmd;
+			}
+			cmd[++i] = tmux->socket;
+		} else {
+			cmd[++i] = strdup("-S");
+			if (!cmd[i]) {
+				r = -ENOMEM;
+				goto err_cmd;
+			}
+			cmd[++i] = tmux->socket_path;
+		}
+	}
+
+	if (tmux->config) {
+		cmd[++i] = strdup("-f");
+		if (!cmd[i]) {
+			r = -ENOMEM;
+			goto err_cmd;
+		}
+		cmd[++i] = tmux->config;
+	}
+
+	assert(i + 1 == cmdlen);
+
+	for (i = 0; i < tmux->cmdlen; ++i)
+		if (cmd_freeable(tmux, tmux->cmd[i]))
+			free(tmux->cmd[i]);
+	free(tmux->cmd);
+
+	tmux->cmd = cmd;
+	tmux->cmdlen = cmdlen;
+
+	return r;
+
+err_cmd:
+	for (i = 0; i < cmdlen; ++i)
+		if (cmd_freeable(tmux, cmd[i]))
+			free(cmd[i]);
+	free(cmd);
 	return r;
 }
 
