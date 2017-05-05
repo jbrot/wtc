@@ -32,6 +32,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <wait.h>
 
 struct wtc_tmux_cbs {
 	void (*new_client)(struct wtc_tmux *tmux, 
@@ -145,7 +146,7 @@ void wtc_tmux_unref(struct wtc_tmux *tmux)
  * pipes), then pid, fin, fout, and ferr will be properly populated.
  */
 static int fork_tmux(struct wtc_tmux *tmux, const char *const *cmds, 
-                     int *pid, int *fin, int *fout, int *ferr)
+                     pid_t *pid, int *fin, int *fout, int *ferr)
 {
 	int i;
 	int r = 0;
@@ -201,7 +202,7 @@ static int fork_tmux(struct wtc_tmux *tmux, const char *const *cmds,
 		}
 	}
 
-	int cpid = fork();
+	pid_t cpid = fork();
 	if (cpid == -1) {
 		r = -errno;
 		goto err_perr;
@@ -257,6 +258,97 @@ err_exc:
 	for (int i = 0; i < len; i++)
 		free(exc[i]);
 	free(exc);
+	return r;
+}
+
+static int read_full(int fd, char **out)
+{
+	int r = 0;
+	char *buf = calloc(257, sizeof(char));
+	char *tmp = NULL;
+	int pos = 0;
+	int len = 256;
+	if (!buf)
+		return -ENOMEM;
+	while ((r = read(fd, buf + pos, len - pos)) == len - pos) {
+		pos += r;
+		len *= 2;
+		tmp = realloc(buf, len + 1);
+		if (!tmp) {
+			r = -ENOMEM;
+			goto err_buf;
+		}
+		buf = tmp;
+	}
+
+	if (r == -1) {
+		r = -errno;
+		goto err_buf;
+	}
+
+	pos += r;
+	memset(buf + pos, 0, len + 1 - pos);
+
+	*out = buf;
+	return 0;
+
+err_buf:
+	free(buf);
+	return r;
+}
+
+/*
+ * Run the command specified in cmds, wait for it to finish, and
+ * store its stdout in out and stderr in err. Out and err may be
+ * NULL to indicate the respective streams should be ignored.
+ *
+ * Returns 0 on success and a negative value on failure. Note that
+ * failures during closing the fds will not be reported if an earlier
+ * failure occured (and likewise an error closing the first fd hides
+ * any error closing the second). Furthermore, output may be stored
+ * in *out, *err, or both even if a non-zero exit status is returned
+ * depending on where the error occurs. However, there is a guarantee
+ * that if *out or *err have there values changed, then the new value
+ * points to the complete output on that stream and no errors were
+ * detected while processing it.
+ */
+static int exec_tmux(struct wtc_tmux *tmux, const char *const *cmds, 
+                     char **out, char **err)
+{
+	pid_t pid = 0;
+	int fout, ferr;
+	int *pout, *perr;
+	int r = 0;
+
+	if (!tmux || !cmds)
+		return -EINVAL;
+
+	pout = out ? &fout : NULL;
+	perr = err ? &ferr : NULL;
+
+	r = fork_tmux(tmux, cmds, &pid, NULL, pout, perr);
+	if (!pid)
+		return r;
+
+	if (waitpid(pid, NULL, 0) != pid || r) {
+		r = r ? r : -errno;
+		goto err_fds;
+	}
+
+	if (out) {
+		r = read_full(fout, out);
+		if (r)
+			goto err_fds;
+	}
+
+	if (err)
+		r = read_full(ferr, err);
+
+err_fds:
+	if (out && close(fout) && !r)
+		r = -errno;
+	if (!err && close(ferr) && !r)
+		r = -errno;
 	return r;
 }
 
@@ -457,6 +549,13 @@ int wtc_tmux_connect(struct wtc_tmux *tmux)
 	r = update_cmd(tmux);
 	if (r < 0)
 		return r;
+
+	const char *const cmd[] = { "list-windows", NULL };
+	char *out;
+	r = exec_tmux(tmux, cmd, &out, NULL);
+	if (!r)
+		printf("%s", out);
+	return r;
 }
 
 int wtc_tmux_disconnect(struct wtc_tmux *tmux)
