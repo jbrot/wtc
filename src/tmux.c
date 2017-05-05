@@ -23,9 +23,15 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#define _GNU_SOURCE
+
 #include "tmux.h"
 
+#include <assert.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
 
 struct wtc_tmux_cbs {
 	void (*new_client)(struct wtc_tmux *tmux, 
@@ -66,6 +72,7 @@ struct wtc_tmux {
 	char *socket_path;
 	char *config;
 	char **cmd;
+	int cmdlen;
 
 	bool connected;
 	unsigned int timeout;
@@ -99,19 +106,23 @@ void wtc_tmux_ref(struct wtc_tmux *tmux)
 	tmux->ref++;
 }
 
+static bool cmd_freeable(struct wtc_tmux *tmux, char *ptr)
+{
+	return ptr != tmux->bin &&
+	       ptr != tmux->socket &&
+	       ptr != tmux->socket_path &&
+	       ptr != tmux->config;
+}
+
 void wtc_tmux_unref(struct wtc_tmux *tmux)
 {
 	if (!tmux || !tmux->ref || tmux->ref--)
 		return;
 
 	// TODO Cleanup
-	if (tmux->cmd)
-		for (int i = 0; tmux->cmd[i]; ++i)
-			if (tmux->cmd[i] != tmux->bin &&
-			    tmux->cmd[i] != tmux->socket &&
-			    tmux->cmd[i] != tmux->socket_path &&
-			    tmux->cmd[i] != tmux->config)
-				free(tmux->cmd[i]);
+	for (int i = 0; i < tmux->cmdlen; ++i)
+		if (cmd_freeable(tmux, tmux->cmd[i]))
+			free(tmux->cmd[i]);
 	free(tmux->cmd);
 
 	free(tmux->bin);
@@ -120,6 +131,133 @@ void wtc_tmux_unref(struct wtc_tmux *tmux)
 	free(tmux->config);
 
 	free(tmux);
+}
+
+/*
+ * Fork a tmux process. cmds will be appended to tmux->cmds to produce the
+ * info passed to exec. The resulting process id will be put in pid.
+ * If fin, fout, or ferr are not NULL, then they will be set to a file
+ * descriptor which is the end of a pipe to stdin, stdout, and stderr of the
+ * child process respectively.
+ *
+ * Returns 0 on success and a negative value if an error occurs. However, if
+ * the error occurs after forking (i.e., when closing the child half of the
+ * pipes), then pid, fin, fout, and ferr will be properly populated.
+ */
+static int fork_tmux(struct wtc_tmux *tmux, const char *const *cmds, 
+                     int *pid, int *fin, int *fout, int *ferr)
+{
+	int i;
+	int r = 0;
+
+	if (!tmux || !cmds)
+		return -EINVAL;
+
+	int len = tmux->cmdlen;
+	for (i = 0; cmds[i]; ++i)
+		++len;
+
+	char **exc = calloc(len + 1, sizeof(char *));
+	if (!exc)
+		return -ENOMEM;
+
+	for (i = 0; i < tmux->cmdlen; i++) {
+		exc[i] = strdup(tmux->cmd[i]);
+		if (!exc[i]) {
+			r = -ENOMEM;
+			goto err_exc;
+		}
+	}
+	for ( ; *cmds; ++cmds, ++i) {
+		exc[i] = strdup(*cmds);
+		if (!exc[i]) {
+			r = -ENOMEM;
+			goto err_exc;
+		}
+	}
+
+	int pin[2];
+	int pout[2];
+	int perr[2];
+	if (fin) {
+		r = pipe2(pin, O_CLOEXEC);
+		if (r < 0) {
+			r = -errno;
+			goto err_exc;
+		}
+	}
+	if (fout) {
+		r = pipe2(pout, O_CLOEXEC);
+		if (r < 0) {
+			r = -errno;
+			goto err_pin;
+		}
+	}
+	if (ferr) {
+		r = pipe2(perr, O_CLOEXEC);
+		if (r < 0) {
+			r = -errno;
+			goto err_pout;
+		}
+	}
+
+	int cpid = fork();
+	if (cpid == -1) {
+		r = -errno;
+		goto err_perr;
+	} else if (cpid == 0) { // Child
+		if ((!fin  || dup2(pin[0],  STDIN_FILENO)  != STDIN_FILENO) &&
+		    (!fout || dup2(pout[1], STDOUT_FILENO) != STDOUT_FILENO) &&
+		    (!ferr || dup2(perr[1], STDERR_FILENO) != STDERR_FILENO)) {
+			int err = errno;
+			fprintf(stderr, "Could not change stdio file descriptors!");
+			_exit(err);
+		}
+
+		execv(exc[0], exc);
+		_exit(-errno); // Exec failed
+	}
+
+	// Parent
+	if (pid)
+		*pid = cpid;
+
+	if (fin)
+		*fin = pin[1];
+	if (fout)
+		*fout = pout[0];
+	if (ferr)
+		*ferr = perr[0];
+
+	if(fin && close(pin[0]))
+		r = -errno;
+	if (fout && close(pout[1]) && !r)
+		r = -errno;
+	if (ferr && close(perr[1]) && !r)
+		r = -errno;
+
+	return r;
+
+err_perr:
+	if (ferr) {
+		close(perr[0]);
+		close(perr[1]);
+	}
+err_pout:
+	if (fout) {
+		close(pout[0]);
+		close(pout[1]);
+	}
+err_pin:
+	if (fin) {
+		close(pin[0]);
+		close(pin[1]);
+	}
+err_exc:
+	for (int i = 0; i < len; i++)
+		free(exc[i]);
+	free(exc);
+	return r;
 }
 
 int wtc_tmux_set_bin_file(struct wtc_tmux *tmux, const char *path)
@@ -241,9 +379,84 @@ const char *wtc_tmux_get_config_file(const struct wtc_tmux *tmux)
 	return tmux->config;
 }
 
+static int update_cmd(struct wtc_tmux *tmux)
+{
+	int i = 0;
+	int r = 0;
+
+	int cmdlen = 1 + (wtc_tmux_is_socket_set(tmux) ? 2 : 0)
+	               + (tmux->config ? 2 : 0);
+
+	char **cmd = calloc(cmdlen, sizeof(char *));
+	if (!cmd)
+		return -ENOMEM;
+
+	if (!tmux->bin) {
+		tmux->bin = strdup("/usr/bin/tmux");
+		if (!tmux->bin) {
+			r = -ENOMEM;
+			goto err_cmd;
+		}
+	}
+	cmd[i] = tmux->bin;
+
+	if (wtc_tmux_is_socket_set(tmux)) {
+		if (tmux->socket) {
+			cmd[++i] = strdup("-L");
+			if (!cmd[i]) {
+				r = -ENOMEM;
+				goto err_cmd;
+			}
+			cmd[++i] = tmux->socket;
+		} else {
+			cmd[++i] = strdup("-S");
+			if (!cmd[i]) {
+				r = -ENOMEM;
+				goto err_cmd;
+			}
+			cmd[++i] = tmux->socket_path;
+		}
+	}
+
+	if (tmux->config) {
+		cmd[++i] = strdup("-f");
+		if (!cmd[i]) {
+			r = -ENOMEM;
+			goto err_cmd;
+		}
+		cmd[++i] = tmux->config;
+	}
+
+	assert(i + 1 == cmdlen);
+
+	for (i = 0; i < tmux->cmdlen; ++i)
+		if (cmd_freeable(tmux, tmux->cmd[i]))
+			free(tmux->cmd[i]);
+	free(tmux->cmd);
+
+	tmux->cmd = cmd;
+	tmux->cmdlen = cmdlen;
+
+	return r;
+
+err_cmd:
+	for (i = 0; i < cmdlen; ++i)
+		if (cmd_freeable(tmux, cmd[i]))
+			free(cmd[i]);
+	free(cmd);
+	return r;
+}
+
 int wtc_tmux_connect(struct wtc_tmux *tmux)
 {
-	// TODO
+	int r = 0;
+
+	if (!tmux)
+		return -EINVAL;
+
+	r = update_cmd(tmux);
+	if (r < 0)
+		return r;
 }
 
 int wtc_tmux_disconnect(struct wtc_tmux *tmux)
