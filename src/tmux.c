@@ -83,57 +83,6 @@ struct wtc_tmux {
 	struct wtc_tmux_cbs cbs;
 };
 
-int wtc_tmux_new(struct wtc_tmux **out)
-{
-	struct wtc_tmux *output = calloc(1, sizeof(*output));
-	if (!output)
-		return -ENOMEM;
-
-	output->ref = 1;
-
-	output->timeout = 10000;
-	output->w = 80;
-	output->h = 24;
-
-	*out = output;
-	return 0;
-}
-
-void wtc_tmux_ref(struct wtc_tmux *tmux)
-{
-	if (!tmux || !tmux->ref)
-		return;
-
-	tmux->ref++;
-}
-
-static bool cmd_freeable(struct wtc_tmux *tmux, char *ptr)
-{
-	return ptr != tmux->bin &&
-	       ptr != tmux->socket &&
-	       ptr != tmux->socket_path &&
-	       ptr != tmux->config;
-}
-
-void wtc_tmux_unref(struct wtc_tmux *tmux)
-{
-	if (!tmux || !tmux->ref || tmux->ref--)
-		return;
-
-	// TODO Cleanup
-	for (int i = 0; i < tmux->cmdlen; ++i)
-		if (cmd_freeable(tmux, tmux->cmd[i]))
-			free(tmux->cmd[i]);
-	free(tmux->cmd);
-
-	free(tmux->bin);
-	free(tmux->socket);
-	free(tmux->socket_path);
-	free(tmux->config);
-
-	free(tmux);
-}
-
 /*
  * Fork a tmux process. cmds will be appended to tmux->cmds to produce the
  * info passed to exec. The resulting process id will be put in pid.
@@ -261,6 +210,12 @@ err_exc:
 	return r;
 }
 
+/*
+ * Fully read the current contents of the fd into a newly allocated string.
+ * Returns 0 on success, otherwise returns a negative error code. Can
+ * return -ENOMEM if there are problems allocating the string and any of the
+ * error codes from a call to read().
+ */
 static int read_full(int fd, char **out)
 {
 	int r = 0;
@@ -311,6 +266,8 @@ err_buf:
  * that if *out or *err have there values changed, then the new value
  * points to the complete output on that stream and no errors were
  * detected while processing it.
+ *
+ * TODO handle timeout
  */
 static int exec_tmux(struct wtc_tmux *tmux, const char *const *cmds, 
                      char **out, char **err)
@@ -347,9 +304,60 @@ static int exec_tmux(struct wtc_tmux *tmux, const char *const *cmds,
 err_fds:
 	if (out && close(fout) && !r)
 		r = -errno;
-	if (!err && close(ferr) && !r)
+	if (err && close(ferr) && !r)
 		r = -errno;
 	return r;
+}
+
+int wtc_tmux_new(struct wtc_tmux **out)
+{
+	struct wtc_tmux *output = calloc(1, sizeof(*output));
+	if (!output)
+		return -ENOMEM;
+
+	output->ref = 1;
+
+	output->timeout = 10000;
+	output->w = 80;
+	output->h = 24;
+
+	*out = output;
+	return 0;
+}
+
+void wtc_tmux_ref(struct wtc_tmux *tmux)
+{
+	if (!tmux || !tmux->ref)
+		return;
+
+	tmux->ref++;
+}
+
+static bool cmd_freeable(struct wtc_tmux *tmux, char *ptr)
+{
+	return ptr != tmux->bin &&
+	       ptr != tmux->socket &&
+	       ptr != tmux->socket_path &&
+	       ptr != tmux->config;
+}
+
+void wtc_tmux_unref(struct wtc_tmux *tmux)
+{
+	if (!tmux || !tmux->ref || tmux->ref--)
+		return;
+
+	// TODO Cleanup
+	for (int i = 0; i < tmux->cmdlen; ++i)
+		if (cmd_freeable(tmux, tmux->cmd[i]))
+			free(tmux->cmd[i]);
+	free(tmux->cmd);
+
+	free(tmux->bin);
+	free(tmux->socket);
+	free(tmux->socket_path);
+	free(tmux->config);
+
+	free(tmux);
 }
 
 int wtc_tmux_set_bin_file(struct wtc_tmux *tmux, const char *path)
@@ -539,6 +547,48 @@ err_cmd:
 	return r;
 }
 
+/*
+ * Ensures the version of tmux is new enough to support the needed messages.
+ * Returns 1 if the versions is new enough and 0 if it is not. Will return
+ * a negative error code if something goes wrong checking the version.
+ */
+static int version_check(struct wtc_tmux *tmux)
+{
+	int r = 0;
+	const char *const cmd[] = { "-V", NULL };
+	char *out = NULL;
+	r = exec_tmux(tmux, cmd, &out, NULL);
+	if (r < 0)
+		goto done;
+
+	// We have a guarantee from the source that the version
+	// string contains a space separating the program name
+	// from the version. We assume here the version has no
+	// space in it.
+	char *vst = strrchr(out, ' ');
+	if (!vst) // This really shouldn't happen.
+		goto done;
+	++vst; // To get the start of the version string
+
+	// The master branch should be good.
+	if (strncmp(vst, "master", 6) == 0) {
+		r = 1;
+		goto done;
+	}
+
+	// Process the version as a double. This may not process the entire
+	// version but it should give us a good enough guess to ensure we're
+	// past version 2.4. As future versions come out, we may need more cases
+	// here.
+	double version = atof(vst);
+	if (version > 2.4)
+		r = 1;
+
+done:
+	free(out);
+	return r;
+}
+
 int wtc_tmux_connect(struct wtc_tmux *tmux)
 {
 	int r = 0;
@@ -550,8 +600,22 @@ int wtc_tmux_connect(struct wtc_tmux *tmux)
 	if (r < 0)
 		return r;
 
+	r = version_check(tmux);
+	switch (r) {
+	case 0:
+		// TODO Logging
+		fprintf(stderr, "Invalid tmux version! tmux must either be version "
+		                "'master' or newer than version '2.4'\n");
+		return -1;
+	case 1:
+		r = 0;
+		break;
+	default:
+		return r;
+	}
+
 	const char *const cmd[] = { "list-windows", NULL };
-	char *out;
+	char *out = NULL;
 	r = exec_tmux(tmux, cmd, &out, NULL);
 	if (!r)
 		printf("%s", out);
