@@ -740,11 +740,11 @@ err_ids:
 }
 
 /*
- * Just like parseids, but parses two integer values per line instead of
+ * Just like parseids, but parses three integer values per line instead of
  * one.
  */
-static int parseidsi(const char *fmt, char *str, int *olen,
-                     int **out, int **out2)
+static int parseidsii(const char *fmt, char *str, int *olen,
+                     int **out, int **out2, int **out3)
 {
 	int r = 0;
 
@@ -765,15 +765,22 @@ static int parseidsi(const char *fmt, char *str, int *olen,
 		goto err_ids;
 	}
 
+	int *ids3 = calloc(count, sizeof(int));
+	if (!ids3) {
+		r = -ENOMEM;
+		goto err_ids2;
+	}
+
 	count = 0;
 	char *svptr = NULL;
 	char *pos = strtok_r(str, "\n", &svptr);
 	int linec = 0;
 	while (pos != NULL) {
-		r = sscanf(pos, fmt, &ids[count], &ids2[count], &linec);
-		if (r != 2 || linec != strlen(pos)) { // Parse error
+		r = sscanf(pos, fmt, &ids[count], &ids2[count], 
+		           &ids3[count], &linec);
+		if (r != 3 || linec != strlen(pos)) { // Parse error
 			r = -EINVAL;
-			goto err_ids2;
+			goto err_ids3;
 		}
 
 		count++;
@@ -783,8 +790,11 @@ static int parseidsi(const char *fmt, char *str, int *olen,
 	*olen = count;
 	*out = ids;
 	*out2 = ids2;
+	*out3 = ids3;
 	return 0;
 
+err_ids3:
+	free(ids3);
 err_ids2:
 	free(ids2);
 err_ids:
@@ -816,8 +826,9 @@ static int reload_windows(struct wtc_tmux *tmux)
 {
 	int r = 0;
 	// First, establish the list of windows.
-	const char *cmd[] = { "list-windows", "-aF", "#{window_id}",
-	                      NULL, NULL, NULL };
+	const char *cmd[] = { "list-windows", "-aF", 
+	                      "#{window_id} #{session_id} #{window_active}",
+	                      NULL };
 	char *out = NULL;
 	r = exec_tmux(tmux, cmd, &out, NULL);
 	if (r < 0) // We swallow non-zero exit to handle no server being up
@@ -825,7 +836,9 @@ static int reload_windows(struct wtc_tmux *tmux)
 
 	int count;
 	int *wids;
-	r = parseids("@%u%n", out, &count, &wids);
+	int *sids;
+	int *active;
+	r = parseidsii("@%u $%u %u%n", out, &count, &wids, &sids, &active);
 	if (r < 0)
 		goto err_out;
 
@@ -833,25 +846,36 @@ static int reload_windows(struct wtc_tmux *tmux)
 	// with the actual windows list. We also clear the linked list while
 	// we're at it.
 	struct wtc_tmux_window *wind, *tmp;
+	bool found;
 	HASH_ITER(hh, tmux->windows, wind, tmp) {
 		wind->previous = NULL;
 		wind->next = NULL;
 
+		found = false;
 		for (int i = 0; i < count; ++i) {
+			// We don't have a uniqueness guaranee so we need to keep going
 			if (wind->id == wids[i]) {
-				wids[i] = -1;
-				goto icont;
+				wids[i] = -wids[i];
+				found = true;
 			}
 		}
+		if (found)
+			continue;
 
 		HASH_DEL(tmux->windows, wind);
 		free(wind); // TODO possible ref count?
-
-		icont: ;
 	}
 
 	for (int i = 0; i < count; ++i) {
-		if (wids[i] == -1)
+		if (wids[i] < 0) {
+			wids[i] = -wids[i];
+			continue;
+		}
+
+		// Because of session groups, we don't have a uniqueness guarantee
+		wind = NULL;
+		HASH_FIND_INT(tmux->windows, &wids[i], wind);
+		if (wind)
 			continue;
 
 		wind = calloc(1, sizeof(struct wtc_tmux_session));
@@ -864,81 +888,65 @@ static int reload_windows(struct wtc_tmux *tmux)
 	}
 
 	// Now to update the linked lists
-	char *cmd2 = NULL;
-	cmd[1] = "-t";
-	cmd[2] = NULL;
-	cmd[3] = "-F";
-	cmd[4] = "#{window_id} #{window_active}";
-
-	bool found;
-	int *active = NULL;
-	struct wtc_tmux_session *sess;
+	// -1 -- determine, 0 -- fill in list, 1 -- search for active, 2 -- skip
+	int state;
 	struct wtc_tmux_window *prev;
-	for (sess = tmux->sessions; sess; sess = sess->hh.next) {
-		free(cmd2); cmd2 = NULL;
-		r = bprintf(&cmd2, "$%u", sess->id);
-		if (r < 0)
-			goto err_act;
+	struct wtc_tmux_session *sess;
+	for (int i = 0; i < count; ++i) {
+		if (i == 0 || sids[i] != sids[i - 1]) {
+			HASH_FIND_INT(tmux->sessions, &sids[i], sess);
+			if (!sess) {
+				r = -EINVAL;
+				goto err_wids;
+			}
 
-		cmd[2] = cmd2;
-		r = exec_tmux(tmux, cmd, &out, NULL);
-		if (r)
-			goto err_act;
-
-		free(wids); wids = NULL;
-		free(active); active = NULL;
-		r = parseidsi("@%u %u%n", out, &count, &wids, &active);
-		if (r < 0)
-			goto err_act;
-
-		sess->window_count = count;
-		if (count == 0) {
-			// TODO logging
-			printf("Session $%u has no windows!", sess->id);
-			sess->active_window = NULL;
-			sess->windows = NULL;
-			continue;
+			state = -1;
+			sess->window_count = 0;
+			prev = NULL;
 		}
 
-		HASH_FIND_INT(tmux->windows, &wids[0], wind);
-		if (active[0])
-			sess->active_window = wind;
+		sess->window_count++;
+		if (state == 2)
+			continue;
 
-		if (wind->previous || wind->next) {
-			found = true;
-			for (tmp = wind; tmp->previous; tmp = tmp->previous) ;
-			sess->windows = tmp;
-			if (active[0])
-				continue;
-		} else {
-			found = false;
-			sess->windows = wind;
+		HASH_FIND_INT(tmux->windows, &wids[i], wind);
+		if (!wind) {
+			r = -EINVAL;
+			goto err_wids;
+		}
+
+		if (active[i]) {
+			sess->active_window = wind;
+			if (state == 1)
+				state = 2;
+		}
+
+		if (state == -1) {
+			if (wind->next || wind->previous) {
+				state = active[i] ? 2 : 1;
+				for (; wind->previous; wind = wind->previous) ;
+				sess->windows = wind;
+			} else {
+				state = 0;
+				sess->windows = wind;
+			}
+		}
+
+		if (state != 0)
+			continue;
+
+		if (prev) {
+			prev->next = wind;
+			wind->previous = prev;
 		}
 
 		prev = wind;
-		for (int i = 1; i < count; ++i) {
-			if (found && !active[i])
-				continue;
-
-			HASH_FIND_INT(tmux->windows, &wids[i], wind);
-			if (active[i])
-				sess->active_window = wind;
-			if (found)
-				break;
-
-			wind->previous = prev;
-			prev->next = wind;
-			prev = wind;
-		}
 	}
 
-	r = reload_panels(tmux);
-
-err_act:
-	free(active);
-	free(cmd2);
 err_wids:
 	free(wids);
+	free(sids);
+	free(active);
 err_out:
 	free(out);
 	return r;
