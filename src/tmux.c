@@ -802,25 +802,154 @@ err_ids:
 	return r;
 }
 
-// TODO
-static int reload_panels(struct wtc_tmux *tmux)
+/*
+ * Reload the panes on the server. Note that, when calling this, it is
+ * imperative that the windows are already up to date. Depending on where
+ * this fails, the server representation may be left in a corrupted state
+ * and the only viable method of recovery is to retry this function.
+ *
+ * WARNING: There is a race condition because there is no synchronization
+ * between multiple calls to tmux and this function requires several calls.
+ */
+static int reload_panes(struct wtc_tmux *tmux)
 {
-	return 0;
+	int r = 0;
+	// First, establish the list of panes.
+	const char *cmd[] = { "list-panes", "-aF", 
+	                      "#{pane_id} #{window_id} #{pane_active}",
+	                      NULL };
+	char *out = NULL;
+	r = exec_tmux(tmux, cmd, &out, NULL);
+	if (r < 0) // We swallow non-zero exit to handle no server being up
+		goto err_out;
+
+	int count;
+	int *pids;
+	int *wids;
+	int *active;
+	r = parseidsii("%%%u @%u %u%n", out, &count, &pids, &wids, &active);
+	if (r < 0)
+		goto err_out;
+
+	// We now need to synchronize the panes list in the tmux object
+	// with the actual panes list. We also clear the linked list while
+	// we're at it.
+	struct wtc_tmux_pane *pane, *tmp;
+	bool found;
+	HASH_ITER(hh, tmux->panes, pane, tmp) {
+		pane->previous = NULL;
+		pane->next = NULL;
+
+		found = false;
+		for (int i = 0; i < count; ++i) {
+			// We don't have a uniqueness guarantee so we need to keep going
+			if (pane->id == pids[i]) {
+				pids[i] = -pids[i];
+				found = true;
+			}
+		}
+		if (found)
+			continue;
+
+		HASH_DEL(tmux->panes, pane);
+		free(pane); // TODO possible ref count?
+	}
+
+	for (int i = 0; i < count; ++i) {
+		if (pids[i] < 0) {
+			pids[i] = -pids[i];
+			continue;
+		}
+
+		// Because of session groups, we don't have a uniqueness guarantee
+		pane = NULL;
+		HASH_FIND_INT(tmux->panes, &pids[i], pane);
+		if (pane)
+			continue;
+
+		pane = calloc(1, sizeof(struct wtc_tmux_pane));
+		if (!pane) {
+			r = -ENOMEM;
+			goto err_pids;
+		}
+		pane->id = pids[i];
+		HASH_ADD_INT(tmux->panes, id, pane);
+	}
+
+	// Now to update the linked lists. Although the same window may be
+	// listed multiple times, unlike with windows/sessions, a pane will
+	// only be associated with one window and so the repeated entries will
+	// be identical to the first time.
+	// -1 -- determine, 0 -- fill in list, 2 -- skip
+	int state;
+	struct wtc_tmux_pane *prev;
+	struct wtc_tmux_window *wind;
+	for (int i = 0; i < count; ++i) {
+		if (i == 0 || wids[i] != wids[i - 1]) {
+			HASH_FIND_INT(tmux->windows, &wids[i], wind);
+			if (!wind) {
+				r = -EINVAL;
+				goto err_pids;
+			}
+
+			state = -1;
+			prev = NULL;
+		}
+
+		if (state == 2)
+			continue;
+
+		HASH_FIND_INT(tmux->panes, &pids[i], pane);
+		if (!pane) {
+			r = -EINVAL;
+			goto err_pids;
+		}
+
+		if (state == -1) {
+			if (pane->next || pane->previous) {
+				state = 2;
+				continue;
+			} else {
+				state = 0;
+				wind->panes = pane;
+				wind->pane_count = 0;
+			}
+		}
+
+		wind->pane_count++;
+
+		if (active[i])
+			wind->active_pane = pane;
+
+		if (prev) {
+			prev->next = pane;
+			pane->previous = prev;
+		}
+
+		prev = pane;
+	}
+
+	// TODO deal with layout
+
+err_pids:
+	free(pids);
+	free(wids);
+	free(active);
+err_out:
+	free(out);
+	return r;
 }
 
 /*
  * Reload the windows on the server. Note that, when calling this, it is
- * imperative that the sessions are already up to date.
- * the entire representation gets updated as the sessions are
- * the root node of the representation tree. Note that depending on where
+ * imperative that the sessions are already up to date. Depending on where
  * this fails, the server representation may be left in a corrupted state
- * and the only viable method of recovery is to try the entire process
- * again.
+ * and the only viable method of recovery is to retry this function. As a
+ * result of calling this function, the panes will be reloaded as well.
  *
- * WARNING: There is a race condition. This function relies on many
- * sequential calls to the server with no guarantees of atomicity. If
- * the server changes state while this function is running, bad things
- * will happen.
+ * WARNING: There is a race condition because there is no synchronization
+ * between multiple calls to tmux. This function itself only needs one
+ * call, but it also calls reload_panes which requires several.
  */
 static int reload_windows(struct wtc_tmux *tmux)
 {
@@ -853,7 +982,7 @@ static int reload_windows(struct wtc_tmux *tmux)
 
 		found = false;
 		for (int i = 0; i < count; ++i) {
-			// We don't have a uniqueness guaranee so we need to keep going
+			// We don't have a uniqueness guarantee so we need to keep going
 			if (wind->id == wids[i]) {
 				wids[i] = -wids[i];
 				found = true;
@@ -878,7 +1007,7 @@ static int reload_windows(struct wtc_tmux *tmux)
 		if (wind)
 			continue;
 
-		wind = calloc(1, sizeof(struct wtc_tmux_session));
+		wind = calloc(1, sizeof(struct wtc_tmux_window));
 		if (!wind) {
 			r = -ENOMEM;
 			goto err_wids;
@@ -942,6 +1071,8 @@ static int reload_windows(struct wtc_tmux *tmux)
 
 		prev = wind;
 	}
+
+	r = reload_panes(tmux);
 
 err_wids:
 	free(wids);
