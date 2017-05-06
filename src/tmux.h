@@ -41,6 +41,7 @@
 #include "uthash.h"
 
 struct wtc_tmux;
+struct wtc_tmux_client;
 struct wtc_tmux_window;
 
 /*

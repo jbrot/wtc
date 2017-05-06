@@ -682,23 +682,25 @@ err_out:
 }
 
 /*
- * Parses ids from a string. It is assumed one id is on each line and each 
- * id can be expressed by an int. The specific format of each line is in 
- * fmt. fmt is passed to scanf and must have one conversion (the id) and 
- * end with "%n". The number reported by "%n" will be compared with the line
- * length, if they do not match it is considered a parse error. A good
- * example of a fmt is "$%u%n" to match lines of the form "$<id>". 
+ * The following functions all parse the input string str line by line
+ * per a format string fmt. What gets parsed in each line varies from
+ * function to function. The number of lines parsed is put into *olen
+ * while the contents of each line are put into *out (and friends).
+ * *out (and friends) will be dynamically allocated. Unless specified
+ * elsewhere, the fmt should always end with "%n" to allow full line
+ * parsing verification.
  *
- * Returns 0 on succcess, -EINVAL if any of the inputs is NULL or if there 
- * is a parse error, and -ENOMEM if there is an error allocating space for
- * the ids. On success, the newly allocated ids will be stored in *out and
- * the amount of ids in *out will be put in *olen. Note that when parsing 
- * str, newlines will be converted into '\0'. If a parse error occurs in the
- * middle of the string, *out and *olen will be left unchanged but str will 
- * not be restored to its original position. If its important that str 
- * remains unchanged, make a copy before calling this function. 
+ * Theses functions return 0 on success, -EIVAl if passed NULL inputs or if
+ * there is a parse error, and -ENOMEM if the output arrays can't be
+ * created. If there is a non-zero return, *olen and *out will not be
+ * modified. However, lines are parsed from str via strtok_r, which means
+ * that str will be modified during parsing. str will not be restored to
+ * its original state, so if it is important that str is unchanged, make
+ * a copy before calling one of these functions.
+ *
+ * Example parselni fmt: "$%u%n"
  */
-static int parseids(const char *fmt, char *str, int *olen, int **out)
+static int parselni(const char *fmt, char *str, int *olen, int **out)
 {
 	int r = 0;
 
@@ -711,8 +713,8 @@ static int parseids(const char *fmt, char *str, int *olen, int **out)
 	for (int i = 0; str[i]; ++i)
 		count += str[i] == '\n';
 
-	int *ids = calloc(count, sizeof(int));
-	if (!ids)
+	int *is = calloc(count, sizeof(int));
+	if (!is)
 		return -ENOMEM;
 
 	count = 0;
@@ -720,55 +722,56 @@ static int parseids(const char *fmt, char *str, int *olen, int **out)
 	char *pos = strtok_r(str, "\n", &svptr);
 	int linec = 0;
 	while (pos != NULL) {
-		r = sscanf(pos, fmt, &ids[count], &linec);
+		r = sscanf(pos, fmt, &is[count], &linec);
 		if (r != 1 || linec != strlen(pos)) { // Parse error
 			r = -EINVAL;
-			goto err_ids;
+			goto err_is;
 		}
 
 		count++;
 		pos = strtok_r(NULL, "\n", &svptr);
 	}
 
-	*out = ids;
+	*out = is;
 	*olen = count;
 	return 0;
 
-err_ids:
-	free(ids);
+err_is:
+	free(is);
 	return r;
 }
 
 /*
- * Just like parseids, but parses three integer values per line instead of
- * one.
+ * Parse three integers per line instead of one.
+ *
+ * Example parselniii format: "$%u @%u %u%n"
  */
-static int parseidsii(const char *fmt, char *str, int *olen,
+static int parselniii(const char *fmt, char *str, int *olen,
                      int **out, int **out2, int **out3)
 {
 	int r = 0;
 
-	if (!fmt || !str || !olen || !out || !out2)
+	if (!fmt || !str || !olen || !out || !out2 || !out3)
 		return -EINVAL;
 
 	int count = 0;
 	for (int i = 0; str[i]; ++i)
 		count += str[i] == '\n';
 
-	int *ids = calloc(count, sizeof(int));
-	if (!ids)
+	int *is = calloc(count, sizeof(int));
+	if (!is)
 		return -ENOMEM;
 
-	int *ids2 = calloc(count, sizeof(int));
-	if (!ids2) {
+	int *is2 = calloc(count, sizeof(int));
+	if (!is2) {
 		r = -ENOMEM;
-		goto err_ids;
+		goto err_is;
 	}
 
-	int *ids3 = calloc(count, sizeof(int));
-	if (!ids3) {
+	int *is3 = calloc(count, sizeof(int));
+	if (!is3) {
 		r = -ENOMEM;
-		goto err_ids2;
+		goto err_is2;
 	}
 
 	count = 0;
@@ -776,11 +779,11 @@ static int parseidsii(const char *fmt, char *str, int *olen,
 	char *pos = strtok_r(str, "\n", &svptr);
 	int linec = 0;
 	while (pos != NULL) {
-		r = sscanf(pos, fmt, &ids[count], &ids2[count], 
-		           &ids3[count], &linec);
+		r = sscanf(pos, fmt, &is[count], &is2[count], 
+		           &is3[count], &linec);
 		if (r != 3 || linec != strlen(pos)) { // Parse error
 			r = -EINVAL;
-			goto err_ids3;
+			goto err_is3;
 		}
 
 		count++;
@@ -788,17 +791,102 @@ static int parseidsii(const char *fmt, char *str, int *olen,
 	}
 
 	*olen = count;
-	*out = ids;
-	*out2 = ids2;
-	*out3 = ids3;
+	*out = is;
+	*out2 = is2;
+	*out3 = is3;
 	return 0;
 
-err_ids3:
-	free(ids3);
-err_ids2:
-	free(ids2);
-err_ids:
-	free(ids);
+err_is3:
+	free(is3);
+err_is2:
+	free(is2);
+err_is:
+	free(is);
+	return r;
+}
+
+/*
+ * Parse two integers and a string per line instead of one. Note that the
+ * format should parse everything up until the string and then the rest of
+ * the line will be parsed as the string.
+ *
+ * Example parselniis format: "$%u @%u %n"
+ */
+static int parselniis(const char *fmt, char *str, int *olen,
+                     int **out, int **out2, char ***out3)
+{
+	int r = 0;
+
+	if (!fmt || !str || !olen || !out || !out2 || !out3)
+		return -EINVAL;
+
+	int count = 0, lc = 0, mxl = 0;
+	for (int i = 0; str[i]; ++i) {
+		if (str[i] == '\n') {
+			count++;
+			lc = 0;
+		} else {
+			mxl = mxl > ++lc ? mxl : lc;
+		}
+	}
+	mxl++; // For '\0'
+
+	int *is = calloc(count, sizeof(int));
+	if (!is)
+		return -ENOMEM;
+
+	int *is2 = calloc(count, sizeof(int));
+	if (!is2) {
+		r = -ENOMEM;
+		goto err_is;
+	}
+
+	char **ss = calloc(count, sizeof(char *));
+	if (!ss) {
+		r = -ENOMEM;
+		goto err_is2;
+	}
+	for (int i = 0; i < count; ++i) {
+		ss[i] = calloc(mxl, sizeof(char));
+		if (!ss[i])
+			goto err_ss;
+	}
+
+	int ncount = 0;
+	char *svptr = NULL;
+	char *pos = strtok_r(str, "\n", &svptr);
+	int linec = 0;
+	while (pos != NULL) {
+		r = sscanf(pos, fmt, &is[ncount], &is2[ncount], &linec);
+		if (r != 2) { // Parse error
+			r = -EINVAL;
+			goto err_ss;
+		}
+		strcpy(ss[ncount], pos + linec);
+
+		ncount++;
+		pos = strtok_r(NULL, "\n", &svptr);
+	}
+
+	for (int i = ncount; i < count; ++i)
+		free(ss[i]);
+
+	*olen = ncount;
+	*out = is;
+	*out2 = is2;
+	*out3 = ss;
+	return 0;
+
+err_ss:
+	if (ss) {
+		for (int i = 0; i < count; ++i)
+			free(ss[i]);
+	}
+	free(ss);
+err_is2:
+	free(is2);
+err_is:
+	free(is);
 	return r;
 }
 
@@ -827,7 +915,7 @@ static int reload_panes(struct wtc_tmux *tmux)
 	int *pids;
 	int *wids;
 	int *active;
-	r = parseidsii("%%%u @%u %u%n", out, &count, &pids, &wids, &active);
+	r = parselniii("%%%u @%u %u%n", out, &count, &pids, &wids, &active);
 	if (r < 0)
 		goto err_out;
 
@@ -967,7 +1055,7 @@ static int reload_windows(struct wtc_tmux *tmux)
 	int *wids;
 	int *sids;
 	int *active;
-	r = parseidsii("@%u $%u %u%n", out, &count, &wids, &sids, &active);
+	r = parselniii("@%u $%u %u%n", out, &count, &wids, &sids, &active);
 	if (r < 0)
 		goto err_out;
 
@@ -1083,10 +1171,115 @@ err_out:
 	return r;
 }
 
-// TODO
+/*
+ * Reload the clients on the server. Note that, when calling this, it is
+ * imperative that the sessions are already up to date. Depending on where
+ * this fails, the server representation may be left in a corrupted state
+ * and the only viable method of recovery is to retry this function.
+ *
+ * Note: Unlike the other reload functions, this one only requiers one call
+ * to tmux and so does not have a race condition.
+ */
 static int reload_clients(struct wtc_tmux *tmux)
 {
-	return 0;
+	int r = 0;
+	// First, establish the list of clients.
+	const char *cmd[] = { "list-clients", "-F", 
+	                      "#{session_id} #{client_pid} |#{client_name}",
+	                      NULL };
+	char *out = NULL;
+	r = exec_tmux(tmux, cmd, &out, NULL);
+	if (r < 0) // We swallow non-zero exit to handle no server being up
+		goto err_out;
+
+	int count;
+	int *sids;
+	int *cpids;
+	char **names;
+	r = parselniis("$%u %u |%n", out, &count, &sids, &cpids, &names);
+	if (r < 0)
+		goto err_out;
+
+	// We now need to synchronize the clients list in the tmux object
+	// with the actual clients list. We also clear the linked list while
+	// we're at it.
+	struct wtc_tmux_client *client, *tmp;
+	HASH_ITER(hh, tmux->clients, client, tmp) {
+		client->previous = NULL;
+		client->next = NULL;
+
+		for (int i = 0; i < count; ++i) {
+			if (client->pid == cpids[i]) {
+				cpids[i] = -1;
+				goto icont;
+			}
+		}
+
+		HASH_DEL(tmux->clients, client);
+		free(client); // TODO possible ref count?
+
+		icont: ;
+	}
+
+	for (int i = 0; i < count; ++i) {
+		if (cpids[i] < 0)
+			continue;
+
+		client = calloc(1, sizeof(struct wtc_tmux_client));
+		if (!client) {
+			r = -ENOMEM;
+			goto err_ids;
+		}
+		client->pid = cpids[i];
+		client->name = strdup(names[i]);
+		if (!client->name) {
+			r = -ENOMEM;
+			goto err_ids;
+		}
+		HASH_ADD_KEYPTR(hh, tmux->clients, client->name, 
+		                strlen(client->name), client);
+	}
+
+	// Now to update the linked lists.
+	struct wtc_tmux_client *prev;
+	struct wtc_tmux_session *sess;
+	for (int i = 0; i < count; ++i) {
+		HASH_FIND(hh, tmux->clients, names[i], strlen(names[i]), client);
+		if (!client) {
+			r = -EINVAL;
+			goto err_ids;
+		}
+
+		if (i == 0 || sids[i] != sids[i - 1]) {
+			HASH_FIND_INT(tmux->sessions, &sids[i], sess);
+			if (!sess) {
+				r = -EINVAL;
+				goto err_ids;
+			}
+
+			prev = NULL;
+			sess->clients = client;
+		}
+
+		if (prev) {
+			prev->next = client;
+			client->previous = prev;
+		}
+
+		prev = client;
+	}
+
+err_ids:
+	if (names) {
+		for (int i = 0; i < count; ++i)
+			free(names[i]);
+	}
+	free(names);
+	free(sids);
+	free(cpids);
+err_out:
+	free(out);
+	return r;
 }
 
 /*
@@ -1116,7 +1309,7 @@ static int reload_sessions(struct wtc_tmux *tmux)
 
 	int count;
 	int *sids;
-	r = parseids("$%u%n", out, &count, &sids);
+	r = parselni("$%u%n", out, &count, &sids);
 	if (r < 0)
 		goto err_out;
 
