@@ -36,28 +36,28 @@
 #include <wait.h>
 
 struct wtc_tmux_cbs {
-	void (*new_client)(struct wtc_tmux *tmux, 
+	void (*new_client)(struct wtc_tmux *tmux,
 	                   const struct wtc_tmux_client *client);
-	void (*client_session_changed)(struct wtc_tmux *tmux, 
+	void (*client_session_changed)(struct wtc_tmux *tmux,
 	                               const struct wtc_tmux_client *client);
 
-	void (*new_session)(struct wtc_tmux *tmux, 
+	void (*new_session)(struct wtc_tmux *tmux,
 	                    const struct wtc_tmux_session *session);
-	void (*session_closed)(struct wtc_tmux *tmux, 
+	void (*session_closed)(struct wtc_tmux *tmux,
 	                       const struct wtc_tmux_session *session);
-	void (*session_window_changed)(struct wtc_tmux *tmux, 
+	void (*session_window_changed)(struct wtc_tmux *tmux,
 	                               const struct wtc_tmux_session *session);
 
-	void (*new_window)(struct wtc_tmux *tmux, 
+	void (*new_window)(struct wtc_tmux *tmux,
 	                   const struct wtc_tmux_window *window);
-	void (*window_closed)(struct wtc_tmux *tmux, 
+	void (*window_closed)(struct wtc_tmux *tmux,
 	                      const struct wtc_tmux_window *window);
-	void (*window_layout_changed)(struct wtc_tmux *tmux, 
+	void (*window_layout_changed)(struct wtc_tmux *tmux,
 	                              const struct wtc_tmux_window *window);
-	void (*window_pane_changed)(struct wtc_tmux *tmux, 
+	void (*window_pane_changed)(struct wtc_tmux *tmux,
 	                            const struct wtc_tmux_window *window);
 
-	void (*pane_mode_changed)(struct wtc_tmux *tmux, 
+	void (*pane_mode_changed)(struct wtc_tmux *tmux,
 	                          const struct wtc_tmux_pane *pane);
 };
 
@@ -132,7 +132,7 @@ static int bprintf(char **out, const char *format, ...)
  * the error occurs after forking (i.e., when closing the child half of the
  * pipes), then pid, fin, fout, and ferr will be properly populated.
  */
-static int fork_tmux(struct wtc_tmux *tmux, const char *const *cmds, 
+static int fork_tmux(struct wtc_tmux *tmux, const char *const *cmds,
                      pid_t *pid, int *fin, int *fout, int *ferr)
 {
 	int i;
@@ -300,19 +300,19 @@ err_buf:
  * NULL to indicate the respective streams should be ignored.
  *
  * Returns the client exit status (non-negative) or a negative value on
- * failure. Note that failures during closing the fds will not be reported 
- * if an earlier failure occured (and likewise an error closing the first 
+ * failure. Note that failures during closing the fds will not be reported
+ * if an earlier failure occured (and likewise an error closing the first
  * fd hides any error closing the second). If an error occurs after the
  * client exits, the negative error code will be reported instead of the
- * client exit status. Furthermore, output may be stored in *out, *err, or 
- * both even if a negative exit status is returned depending on where the 
- * error occurs. However, there is a guarantee that if *out or *err have 
- * their values changed, then the new value points to the complete output 
+ * client exit status. Furthermore, output may be stored in *out, *err, or
+ * both even if a negative exit status is returned depending on where the
+ * error occurs. However, there is a guarantee that if *out or *err have
+ * their values changed, then the new value points to the complete output
  * on that stream and no errors were detected while processing it.
  *
  * TODO handle timeout
  */
-static int exec_tmux(struct wtc_tmux *tmux, const char *const *cmds, 
+static int exec_tmux(struct wtc_tmux *tmux, const char *const *cmds,
                      char **out, char **err)
 {
 	pid_t pid = 0;
@@ -373,8 +373,8 @@ err_fds:
 #define WTC_TMUX_OPTION_GLOBAL  1<<0
 #define WTC_TMUX_OPTION_WINDOW  0
 #define WTC_TMUX_OPTION_SESSION 1<<1
-#define WTC_TMUX_OPTION_SERVER  1<<2 
-static int get_option(struct wtc_tmux *tmux, const char *name, 
+#define WTC_TMUX_OPTION_SERVER  1<<2
+static int get_option(struct wtc_tmux *tmux, const char *name,
                       int target, int mode, char **out)
 {
 	int r = 0;
@@ -636,7 +636,7 @@ done:
  * Update the information on the sessions' status bar.
  */
 static int update_session_status(struct wtc_tmux *tmux,
-                                 struct wtc_tmux_session *sess, 
+                                 struct wtc_tmux_session *sess,
                                  bool gstatus, bool gstop)
 {
 	int r = 0;
@@ -658,7 +658,7 @@ static int update_session_status(struct wtc_tmux *tmux,
 	}
 
 	free(out); out = NULL;
-	r = get_option(tmux, "status-position", sess->id, 
+	r = get_option(tmux, "status-position", sess->id,
 	               WTC_TMUX_OPTION_SESSION, &out);
 	if (r)
 		goto err_out;
@@ -673,7 +673,7 @@ static int update_session_status(struct wtc_tmux *tmux,
 		goto err_out;
 	}
 
-	sess->statusbar = !status ? WTC_TMUX_SESSION_OFF : 
+	sess->statusbar = !status ? WTC_TMUX_SESSION_OFF :
 	                   top ? WTC_TMUX_SESSION_TOP : WTC_TMUX_SESSION_BOTTOM;
 
 err_out:
@@ -685,13 +685,13 @@ err_out:
 /*
  * Reload the windows on the server. Note that, when calling this, it is
  * imperative that the sessions are already up to date.
- * the entire representation gets updated as the sessions are 
- * the root node of the representation tree. Note that depending on where 
- * this fails, the server representation may be left in a corrupted state 
+ * the entire representation gets updated as the sessions are
+ * the root node of the representation tree. Note that depending on where
+ * this fails, the server representation may be left in a corrupted state
  * and the only viable method of recovery is to try the entire process
  * again.
  *
- * WARNING: There is a race condition. This function relies on many 
+ * WARNING: There is a race condition. This function relies on many
  * sequential calls to the server with no guarantees of atomicity. If
  * the server changes state while this function is running, bad things
  * will happen.
@@ -785,12 +785,12 @@ static int reload_clients(struct wtc_tmux *tmux)
 
 /*
  * Reload the sessions on the server. Note that as a result of calling this,
- * the entire representation gets updated as the sessions are the root node 
- * of the representation tree. Note that depending on where this fails, the 
- * server representation may be left in a corrupted state and the only 
+ * the entire representation gets updated as the sessions are the root node
+ * of the representation tree. Note that depending on where this fails, the
+ * server representation may be left in a corrupted state and the only
  * viable method of recovery is to try the entire process again.
  *
- * WARNING: There is a race condition. This function relies on many 
+ * WARNING: There is a race condition. This function relies on many
  * sequential calls to the server with no guarantees of atomicity. If
  * the server changes state while this function is running, bad things
  * will happen.
@@ -875,7 +875,7 @@ static int reload_sessions(struct wtc_tmux *tmux)
 	printf("count: %d\n", count);
 	if (count) {
 		free(out); out = NULL;
-		r = get_option(tmux, "status", 0, 
+		r = get_option(tmux, "status", 0,
 		               WTC_TMUX_OPTION_GLOBAL | WTC_TMUX_OPTION_SESSION,
 		               &out);
 		if (r)
@@ -890,7 +890,7 @@ static int reload_sessions(struct wtc_tmux *tmux)
 		}
 
 		free(out); out = NULL;
-		r = get_option(tmux, "status-position", 0, 
+		r = get_option(tmux, "status-position", 0,
 		               WTC_TMUX_OPTION_GLOBAL | WTC_TMUX_OPTION_SESSION,
 		               &out);
 		if (r)
@@ -1079,7 +1079,7 @@ unsigned int wtc_tmux_get_height(const struct wtc_tmux *tmux)
 	return tmux->h;
 }
 
-int wtc_tmux_set_new_client_cb(struct wtc_tmux *tmux, 
+int wtc_tmux_set_new_client_cb(struct wtc_tmux *tmux,
 	void (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_client *client))
 {
 	if (!tmux)
@@ -1089,7 +1089,7 @@ int wtc_tmux_set_new_client_cb(struct wtc_tmux *tmux,
 	return 0;
 }
 
-int wtc_tmux_set_client_session_changed_cb(struct wtc_tmux *tmux, 
+int wtc_tmux_set_client_session_changed_cb(struct wtc_tmux *tmux,
 	void (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_client *client))
 {
 	if (!tmux)
@@ -1099,7 +1099,7 @@ int wtc_tmux_set_client_session_changed_cb(struct wtc_tmux *tmux,
 	return 0;
 }
 
-int wtc_tmux_set_new_session_cb(struct wtc_tmux *tmux, 
+int wtc_tmux_set_new_session_cb(struct wtc_tmux *tmux,
 	void (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_session *sess))
 {
 	if (!tmux)
@@ -1109,7 +1109,7 @@ int wtc_tmux_set_new_session_cb(struct wtc_tmux *tmux,
 	return 0;
 }
 
-int wtc_tmux_set_session_closed_cb(struct wtc_tmux *tmux, 
+int wtc_tmux_set_session_closed_cb(struct wtc_tmux *tmux,
 	void (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_session *sess))
 {
 	if (!tmux)
@@ -1118,7 +1118,7 @@ int wtc_tmux_set_session_closed_cb(struct wtc_tmux *tmux,
 	tmux->cbs.session_closed = cb;
 }
 
-int wtc_tmux_set_session_window_changed_cb(struct wtc_tmux *tmux, 
+int wtc_tmux_set_session_window_changed_cb(struct wtc_tmux *tmux,
 	void (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_session *sess))
 {
 	if (!tmux)
@@ -1127,7 +1127,7 @@ int wtc_tmux_set_session_window_changed_cb(struct wtc_tmux *tmux,
 	tmux->cbs.session_window_changed = cb;
 }
 
-int wtc_tmux_set_new_window_cb(struct wtc_tmux *tmux, 
+int wtc_tmux_set_new_window_cb(struct wtc_tmux *tmux,
 	void (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_window *window))
 {
 	if (!tmux)
@@ -1136,7 +1136,7 @@ int wtc_tmux_set_new_window_cb(struct wtc_tmux *tmux,
 	tmux->cbs.new_window = cb;
 }
 
-int wtc_tmux_set_window_closed_cb(struct wtc_tmux *tmux, 
+int wtc_tmux_set_window_closed_cb(struct wtc_tmux *tmux,
 	void (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_window *window))
 {
 	if (!tmux)
@@ -1144,7 +1144,7 @@ int wtc_tmux_set_window_closed_cb(struct wtc_tmux *tmux,
 
 	tmux->cbs.window_closed = cb;
 }
-int wtc_tmux_set_window_layout_changed_cb(struct wtc_tmux *tmux, 
+int wtc_tmux_set_window_layout_changed_cb(struct wtc_tmux *tmux,
 	void (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_window *window))
 {
 	if (!tmux)
@@ -1153,7 +1153,7 @@ int wtc_tmux_set_window_layout_changed_cb(struct wtc_tmux *tmux,
 	tmux->cbs.window_layout_changed = cb;
 }
 
-int wtc_tmux_set_window_pane_changed_cb(struct wtc_tmux *tmux, 
+int wtc_tmux_set_window_pane_changed_cb(struct wtc_tmux *tmux,
 	void (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_window *window))
 {
 	if (!tmux)
@@ -1162,7 +1162,7 @@ int wtc_tmux_set_window_pane_changed_cb(struct wtc_tmux *tmux,
 	tmux->cbs.window_pane_changed = cb;
 }
 
-int wtc_tmux_set_pane_mode_changed_cb(struct wtc_tmux *tmux, 
+int wtc_tmux_set_pane_mode_changed_cb(struct wtc_tmux *tmux,
 	void (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_pane *pane))
 {
 	if (!tmux)
