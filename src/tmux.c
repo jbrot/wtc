@@ -299,15 +299,16 @@ err_buf:
  * store its stdout in out and stderr in err. Out and err may be
  * NULL to indicate the respective streams should be ignored.
  *
- * Returns 0 on success and a negative value on failure. Note that
- * failures during closing the fds will not be reported if an earlier
- * failure occured (and likewise an error closing the first fd hides
- * any error closing the second). Furthermore, output may be stored
- * in *out, *err, or both even if a non-zero exit status is returned
- * depending on where the error occurs. However, there is a guarantee
- * that if *out or *err have there values changed, then the new value
- * points to the complete output on that stream and no errors were
- * detected while processing it.
+ * Returns the client exit status (non-negative) or a negative value on
+ * failure. Note that failures during closing the fds will not be reported 
+ * if an earlier failure occured (and likewise an error closing the first 
+ * fd hides any error closing the second). If an error occurs after the
+ * client exits, the negative error code will be reported instead of the
+ * client exit status. Furthermore, output may be stored in *out, *err, or 
+ * both even if a negative exit status is returned depending on where the 
+ * error occurs. However, there is a guarantee that if *out or *err have 
+ * their values changed, then the new value points to the complete output 
+ * on that stream and no errors were detected while processing it.
  *
  * TODO handle timeout
  */
@@ -340,9 +341,7 @@ static int exec_tmux(struct wtc_tmux *tmux, const char *const *cmds,
 		r = -EINVAL;
 		goto err_fds;
 	}
-	r = -WEXITSTATUS(status);
-	if (r < 0)
-		goto err_fds;
+	status = WEXITSTATUS(status);
 
 	if (out) {
 		r = read_full(fout, out);
@@ -358,7 +357,7 @@ err_fds:
 		r = -errno;
 	if (err && close(ferr) && !r)
 		r = -errno;
-	return r;
+	return r ? r : status;
 }
 
 /*
@@ -602,7 +601,7 @@ static int version_check(struct wtc_tmux *tmux)
 	const char *const cmd[] = { "-V", NULL };
 	char *out = NULL;
 	r = exec_tmux(tmux, cmd, &out, NULL);
-	if (r < 0)
+	if (r != 0)
 		goto done;
 
 	// We have a guarantee from the source that the version
@@ -645,7 +644,7 @@ static int update_session_status(struct wtc_tmux *tmux,
 	bool status, top;
 
 	r = get_option(tmux, "status", sess->id, WTC_TMUX_OPTION_SESSION, &out);
-	if (r < 0)
+	if (r)
 		goto err_out;
 	if (strncmp(out, "on", 2) == 0) {
 		status = true;
@@ -661,7 +660,7 @@ static int update_session_status(struct wtc_tmux *tmux,
 	free(out); out = NULL;
 	r = get_option(tmux, "status-position", sess->id, 
 	               WTC_TMUX_OPTION_SESSION, &out);
-	if (r < 0)
+	if (r)
 		goto err_out;
 	if (strncmp(out, "top", 3) == 0) {
 		top = true;
@@ -682,10 +681,123 @@ err_out:
 	return r;
 }
 
+// TODO
 /*
- * Reload the entire model of the tmux server.
+ * Reload the windows on the server. Note that, when calling this, it is
+ * imperative that the sessions are already up to date.
+ * the entire representation gets updated as the sessions are 
+ * the root node of the representation tree. Note that depending on where 
+ * this fails, the server representation may be left in a corrupted state 
+ * and the only viable method of recovery is to try the entire process
+ * again.
+ *
+ * WARNING: There is a race condition. This function relies on many 
+ * sequential calls to the server with no guarantees of atomicity. If
+ * the server changes state while this function is running, bad things
+ * will happen.
  */
-static int reload_structure(struct wtc_tmux *tmux)
+static int reload_windows(struct wtc_tmux *tmux)
+{
+	int r = 0;
+	// First, establish the list of windows.
+	const char *const cmd[] = { "list-windows", "-aF", "#{window_id}",
+	                            NULL };
+	char *out = NULL;
+	r = exec_tmux(tmux, cmd, &out, NULL);
+	if (r < 0) // We swallow non-zero exit to handle no server being up
+		goto err_out;
+
+	// Estimate the window count by number of lines
+	// (if there aren't any windows, this will over count)
+	int count = 0;
+	for (int i = 0; out[i]; ++i)
+		count += out[i] == '\n';
+
+	int *wids = calloc(count, sizeof(int));
+	if (!wids) {
+		r = -ENOMEM;
+		goto err_out;
+	}
+
+	count = 0;
+	char *svptr = NULL;
+	char *pos = strtok_r(out, "\n", &svptr);
+	int linec = 0;
+	while (pos != NULL) {
+		r = sscanf(pos, "@%u%n", &wids[count], &linec);
+		if (r != 1 || linec != strlen(pos)) { // Parse error
+			r = -EINVAL;
+			goto err_wids;
+		}
+
+		count++;
+		pos = strtok_r(NULL, "\n", &svptr);
+	}
+
+	// We now need to synchronize the windows list in the tmux object
+	// with the actual windows list. We also clear the linked list while
+	// we're at it.
+	struct wtc_tmux_window *wind, *tmp;
+	HASH_ITER(hh, tmux->windows, wind, tmp) {
+		wind->previous = NULL;
+		wind->next = NULL;
+
+		for (int i = 0; i < count; ++i) {
+			if (wind->id == wids[i]) {
+				wids[i] = -1;
+				goto icont;
+			}
+		}
+
+		HASH_DEL(tmux->windows, wind);
+		free(wind); // TODO possible ref count?
+
+		icont: ;
+	}
+
+	for (int i = 0; i < count; ++i) {
+		if (wids[i] == -1)
+			continue;
+
+		wind = calloc(1, sizeof(struct wtc_tmux_session));
+		if (!wind) {
+			r = -ENOMEM;
+			goto err_wids;
+		}
+		wind->id = wids[i];
+		HASH_ADD_INT(tmux->windows, id, wind);
+	}
+
+	// TODO fill in the linked list.
+
+err_wids:
+	free(wids);
+err_out:
+	free(out);
+	return r;
+}
+
+// TODO
+static int reload_clients(struct wtc_tmux *tmux)
+{
+	return 0;
+}
+
+/*
+ * Reload the sessions on the server. Note that as a result of calling this,
+ * the entire representation gets updated as the sessions are the root node 
+ * of the representation tree. Note that depending on where this fails, the 
+ * server representation may be left in a corrupted state and the only 
+ * viable method of recovery is to try the entire process again.
+ *
+ * WARNING: There is a race condition. This function relies on many 
+ * sequential calls to the server with no guarantees of atomicity. If
+ * the server changes state while this function is running, bad things
+ * will happen.
+ *
+ * TODO Possibly patch tmux to allow atomic queries.
+ */
+static int reload_sessions(struct wtc_tmux *tmux)
 {
 	int r = 0;
 	// First, establish the list of sessions.
@@ -693,10 +805,10 @@ static int reload_structure(struct wtc_tmux *tmux)
 	                            NULL };
 	char *out = NULL;
 	r = exec_tmux(tmux, cmd, &out, NULL);
-	if (r < 0)
+	if (r < 0) // We swallow non-zero exit to handle no server being up
 		goto err_out;
 
-	// First, estimate the session count by number of lines
+	// Estimate the session count by number of lines
 	// (if there aren't any sessions, this will over count)
 	int count = 0;
 	for (int i = 0; out[i]; ++i)
@@ -766,7 +878,7 @@ static int reload_structure(struct wtc_tmux *tmux)
 		r = get_option(tmux, "status", 0, 
 		               WTC_TMUX_OPTION_GLOBAL | WTC_TMUX_OPTION_SESSION,
 		               &out);
-		if (r < 0)
+		if (r)
 			goto err_sids;
 		if (strncmp(out, "on", 2) == 0) {
 			gstatus = true;
@@ -781,7 +893,7 @@ static int reload_structure(struct wtc_tmux *tmux)
 		r = get_option(tmux, "status-position", 0, 
 		               WTC_TMUX_OPTION_GLOBAL | WTC_TMUX_OPTION_SESSION,
 		               &out);
-		if (r < 0)
+		if (r)
 			goto err_sids;
 		if (strncmp(out, "top", 3) == 0) {
 			gstop = true;
@@ -795,7 +907,7 @@ static int reload_structure(struct wtc_tmux *tmux)
 
 	for (sess = tmux->sessions; sess; sess = sess->hh.next) {
 		r = update_session_status(tmux, sess, gstatus, gstop);
-		if (r < 0)
+		if (r)
 			// In this case, the error might be something recoverable and
 			// we've just gone and mucked things up pretty badly, but
 			// what can you do?
@@ -803,6 +915,12 @@ static int reload_structure(struct wtc_tmux *tmux)
 
 		printf("$%u -- %u\n", sess->id, sess->statusbar);
 	}
+
+	r = reload_windows(tmux);
+	if (r)
+		goto err_sids;
+
+	r = reload_clients(tmux);
 
 err_sids:
 	free(sids);
@@ -904,7 +1022,7 @@ int wtc_tmux_connect(struct wtc_tmux *tmux)
 		return r;
 	}
 
-	r = reload_structure(tmux);
+	r = reload_sessions(tmux);
 	return r;
 }
 
