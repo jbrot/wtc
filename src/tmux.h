@@ -404,6 +404,9 @@ wtc_tmux_lookup_pane(const struct wtc_tmux *tmux, int id);
 /*
  * Get the first session in the linked list associated with this tmux
  * object.
+ *
+ * Passing NULL to wtc_tmux_root_session is an error and will result in NULL
+ * being dereferenced.
  */
 const struct wtc_tmux_session *
 wtc_tmux_root_session(const struct wtc_tmux *tmux);

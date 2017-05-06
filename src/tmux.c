@@ -681,7 +681,123 @@ err_out:
 	return r;
 }
 
+/*
+ * Parses ids from a string. It is assumed one id is on each line and each 
+ * id can be expressed by an int. The specific format of each line is in 
+ * fmt. fmt is passed to scanf and must have one conversion (the id) and 
+ * end with "%n". The number reported by "%n" will be compared with the line
+ * length, if they do not match it is considered a parse error. A good
+ * example of a fmt is "$%u%n" to match lines of the form "$<id>". 
+ *
+ * Returns 0 on succcess, -EINVAL if any of the inputs is NULL or if there 
+ * is a parse error, and -ENOMEM if there is an error allocating space for
+ * the ids. On success, the newly allocated ids will be stored in *out and
+ * the amount of ids in *out will be put in *olen. Note that when parsing 
+ * str, newlines will be converted into '\0'. If a parse error occurs in the
+ * middle of the string, *out and *olen will be left unchanged but str will 
+ * not be restored to its original position. If its important that str 
+ * remains unchanged, make a copy before calling this function. 
+ */
+static int parseids(const char *fmt, char *str, int *olen, int **out)
+{
+	int r = 0;
+
+	if (!fmt || !str || !out || !olen)
+		return -EINVAL;
+
+	// First, we estimate with number of lines (this over counts in the
+	// empty case).
+	int count = 0;
+	for (int i = 0; str[i]; ++i)
+		count += str[i] == '\n';
+
+	int *ids = calloc(count, sizeof(int));
+	if (!ids)
+		return -ENOMEM;
+
+	count = 0;
+	char *svptr = NULL;
+	char *pos = strtok_r(str, "\n", &svptr);
+	int linec = 0;
+	while (pos != NULL) {
+		r = sscanf(pos, fmt, &ids[count], &linec);
+		if (r != 1 || linec != strlen(pos)) { // Parse error
+			r = -EINVAL;
+			goto err_ids;
+		}
+
+		count++;
+		pos = strtok_r(NULL, "\n", &svptr);
+	}
+
+	*out = ids;
+	*olen = count;
+	return 0;
+
+err_ids:
+	free(ids);
+	return r;
+}
+
+/*
+ * Just like parseids, but parses two integer values per line instead of
+ * one.
+ */
+static int parseidsi(const char *fmt, char *str, int *olen,
+                     int **out, int **out2)
+{
+	int r = 0;
+
+	if (!fmt || !str || !olen || !out || !out2)
+		return -EINVAL;
+
+	int count = 0;
+	for (int i = 0; str[i]; ++i)
+		count += str[i] == '\n';
+
+	int *ids = calloc(count, sizeof(int));
+	if (!ids)
+		return -ENOMEM;
+
+	int *ids2 = calloc(count, sizeof(int));
+	if (!ids2) {
+		r = -ENOMEM;
+		goto err_ids;
+	}
+
+	count = 0;
+	char *svptr = NULL;
+	char *pos = strtok_r(str, "\n", &svptr);
+	int linec = 0;
+	while (pos != NULL) {
+		r = sscanf(pos, fmt, &ids[count], &ids2[count], &linec);
+		if (r != 2 || linec != strlen(pos)) { // Parse error
+			r = -EINVAL;
+			goto err_ids2;
+		}
+
+		count++;
+		pos = strtok_r(NULL, "\n", &svptr);
+	}
+
+	*olen = count;
+	*out = ids;
+	*out2 = ids2;
+	return 0;
+
+err_ids2:
+	free(ids2);
+err_ids:
+	free(ids);
+	return r;
+}
+
 // TODO
+static int reload_panels(struct wtc_tmux *tmux)
+{
+	return 0;
+}
+
 /*
  * Reload the windows on the server. Note that, when calling this, it is
  * imperative that the sessions are already up to date.
@@ -700,39 +816,18 @@ static int reload_windows(struct wtc_tmux *tmux)
 {
 	int r = 0;
 	// First, establish the list of windows.
-	const char *const cmd[] = { "list-windows", "-aF", "#{window_id}",
-	                            NULL };
+	const char *cmd[] = { "list-windows", "-aF", "#{window_id}",
+	                      NULL, NULL, NULL };
 	char *out = NULL;
 	r = exec_tmux(tmux, cmd, &out, NULL);
 	if (r < 0) // We swallow non-zero exit to handle no server being up
 		goto err_out;
 
-	// Estimate the window count by number of lines
-	// (if there aren't any windows, this will over count)
-	int count = 0;
-	for (int i = 0; out[i]; ++i)
-		count += out[i] == '\n';
-
-	int *wids = calloc(count, sizeof(int));
-	if (!wids) {
-		r = -ENOMEM;
+	int count;
+	int *wids;
+	r = parseids("@%u%n", out, &count, &wids);
+	if (r < 0)
 		goto err_out;
-	}
-
-	count = 0;
-	char *svptr = NULL;
-	char *pos = strtok_r(out, "\n", &svptr);
-	int linec = 0;
-	while (pos != NULL) {
-		r = sscanf(pos, "@%u%n", &wids[count], &linec);
-		if (r != 1 || linec != strlen(pos)) { // Parse error
-			r = -EINVAL;
-			goto err_wids;
-		}
-
-		count++;
-		pos = strtok_r(NULL, "\n", &svptr);
-	}
 
 	// We now need to synchronize the windows list in the tmux object
 	// with the actual windows list. We also clear the linked list while
@@ -768,8 +863,80 @@ static int reload_windows(struct wtc_tmux *tmux)
 		HASH_ADD_INT(tmux->windows, id, wind);
 	}
 
-	// TODO fill in the linked list.
+	// Now to update the linked lists
+	char *cmd2 = NULL;
+	cmd[1] = "-t";
+	cmd[2] = NULL;
+	cmd[3] = "-F";
+	cmd[4] = "#{window_id} #{window_active}";
 
+	bool found;
+	int *active = NULL;
+	struct wtc_tmux_session *sess;
+	struct wtc_tmux_window *prev;
+	for (sess = tmux->sessions; sess; sess = sess->hh.next) {
+		free(cmd2); cmd2 = NULL;
+		r = bprintf(&cmd2, "$%u", sess->id);
+		if (r < 0)
+			goto err_act;
+
+		cmd[2] = cmd2;
+		r = exec_tmux(tmux, cmd, &out, NULL);
+		if (r)
+			goto err_act;
+
+		free(wids); wids = NULL;
+		free(active); active = NULL;
+		r = parseidsi("@%u %u%n", out, &count, &wids, &active);
+		if (r < 0)
+			goto err_act;
+
+		sess->window_count = count;
+		if (count == 0) {
+			// TODO logging
+			printf("Session $%u has no windows!", sess->id);
+			sess->active_window = NULL;
+			sess->windows = NULL;
+			continue;
+		}
+
+		HASH_FIND_INT(tmux->windows, &wids[0], wind);
+		if (active[0])
+			sess->active_window = wind;
+
+		if (wind->previous || wind->next) {
+			found = true;
+			for (tmp = wind; tmp->previous; tmp = tmp->previous) ;
+			sess->windows = tmp;
+			if (active[0])
+				continue;
+		} else {
+			found = false;
+			sess->windows = wind;
+		}
+
+		prev = wind;
+		for (int i = 1; i < count; ++i) {
+			if (found && !active[i])
+				continue;
+
+			HASH_FIND_INT(tmux->windows, &wids[i], wind);
+			if (active[i])
+				sess->active_window = wind;
+			if (found)
+				break;
+
+			wind->previous = prev;
+			prev->next = wind;
+			prev = wind;
+		}
+	}
+
+	r = reload_panels(tmux);
+
+err_act:
+	free(active);
+	free(cmd2);
 err_wids:
 	free(wids);
 err_out:
@@ -808,32 +975,11 @@ static int reload_sessions(struct wtc_tmux *tmux)
 	if (r < 0) // We swallow non-zero exit to handle no server being up
 		goto err_out;
 
-	// Estimate the session count by number of lines
-	// (if there aren't any sessions, this will over count)
-	int count = 0;
-	for (int i = 0; out[i]; ++i)
-		count += out[i] == '\n';
-
-	int *sids = calloc(count, sizeof(int));
-	if (!sids) {
-		r = -ENOMEM;
+	int count;
+	int *sids;
+	r = parseids("$%u%n", out, &count, &sids);
+	if (r < 0)
 		goto err_out;
-	}
-
-	count = 0;
-	char *svptr = NULL;
-	char *pos = strtok_r(out, "\n", &svptr);
-	int linec = 0;
-	while (pos != NULL) {
-		r = sscanf(pos, "$%u%n", &sids[count], &linec);
-		if (r != 1 || linec != strlen(pos)) { // Parse error
-			r = -EINVAL;
-			goto err_sids;
-		}
-
-		count++;
-		pos = strtok_r(NULL, "\n", &svptr);
-	}
 
 	// We now need to synchronize the sessions list in the tmux object
 	// with the actual sessions list.
@@ -1169,4 +1315,10 @@ int wtc_tmux_set_pane_mode_changed_cb(struct wtc_tmux *tmux,
 		return -EINVAL;
 
 	tmux->cbs.pane_mode_changed = cb;
+}
+
+const struct wtc_tmux_session *
+wtc_tmux_root_session(const struct wtc_tmux *tmux)
+{
+	return tmux->sessions;
 }
