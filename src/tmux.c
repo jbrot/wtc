@@ -1168,15 +1168,22 @@ static int reload_panes(struct wtc_tmux *tmux)
 			goto err_pids;
 		}
 
+		// There exists a diabolical case here, that forces us to have to
+		// check this every time: due to window linking, the same window
+		// can actually appear twice in a row meaning our earlier check
+		// of wids won't detect the transition so we need to check here to
+		// prevent creating a loop. Worse yet, if this window has only one
+		// pane pane->next and pane->previous won't be set so we need to
+		// add a tertiary check for pane == prev to not miss such a repeat.
+		if (pane->next || pane->previous || pane == prev) {
+			state = 2;
+			continue;
+		}
+
 		if (state == -1) {
-			if (pane->next || pane->previous) {
-				state = 2;
-				continue;
-			} else {
-				state = 0;
-				wind->panes = pane;
-				wind->pane_count = 0;
-			}
+			state = 0;
+			wind->panes = pane;
+			wind->pane_count = 0;
 		}
 
 		wind->pane_count++;
@@ -1257,9 +1264,6 @@ static int reload_windows(struct wtc_tmux *tmux)
 	struct wtc_tmux_window *wind, *tmp;
 	bool found;
 	HASH_ITER(hh, tmux->windows, wind, tmp) {
-		wind->previous = NULL;
-		wind->next = NULL;
-
 		found = false;
 		for (int i = 0; i < count; ++i) {
 			// We don't have a uniqueness guarantee so we need to keep going
@@ -1297,63 +1301,63 @@ static int reload_windows(struct wtc_tmux *tmux)
 	}
 
 	// Now to update the linked lists
-	// -1 -- determine, 0 -- fill in list, 1 -- search for active, 2 -- skip
-	int state;
-	struct wtc_tmux_window *prev;
-	struct wtc_tmux_session *sess;
+	int wsize = 0;
+	struct wtc_tmux_window **windows = NULL;
+	struct wtc_tmux_window **windows_tmp = NULL;
+	struct wtc_tmux_session *sess = NULL;
 	for (int i = 0; i < count; ++i) {
 		if (i == 0 || sids[i] != sids[i - 1]) {
+			if (sess) {
+				free(sess->windows);
+				sess->windows = windows;
+				windows = NULL;
+			}
+
 			HASH_FIND_INT(tmux->sessions, &sids[i], sess);
 			if (!sess) {
 				r = -EINVAL;
 				goto err_wids;
 			}
 
-			state = -1;
 			sess->window_count = 0;
-			prev = NULL;
+			windows = calloc(4, sizeof(*windows));
+			if (!windows) {
+				r = -ENOMEM;
+				goto err_wids;
+			}
+			wsize = 4;
 		}
-
-		sess->window_count++;
-		if (state == 2)
-			continue;
 
 		HASH_FIND_INT(tmux->windows, &wids[i], wind);
 		if (!wind) {
 			r = -EINVAL;
-			goto err_wids;
+			goto err_windows;
 		}
-
-		if (active[i]) {
+		windows[sess->window_count] = wind;
+		sess->window_count++;
+		if (active[i])
 			sess->active_window = wind;
-			if (state == 1)
-				state = 2;
-		}
 
-		if (state == -1) {
-			if (wind->next || wind->previous) {
-				state = active[i] ? 2 : 1;
-				for (; wind->previous; wind = wind->previous) ;
-				sess->windows = wind;
-			} else {
-				state = 0;
-				sess->windows = wind;
+		if (sess->window_count == wsize) {
+			wsize *= 2;
+			windows_tmp = realloc(windows, wsize * sizeof(*windows));
+			if (!windows_tmp) {
+				r = -ENOMEM;
+				goto err_windows;
 			}
+			windows = windows_tmp;
 		}
-
-		if (state != 0)
-			continue;
-
-		if (prev) {
-			prev->next = wind;
-			wind->previous = prev;
-		}
-
-		prev = wind;
+	}
+	if (sess) {
+		free(sess->windows);
+		sess->windows = windows;
+		windows = NULL;
 	}
 
 	r = reload_panes(tmux);
 
+err_windows:
+	free(windows);
 err_wids:
 	free(wids);
 	free(sids);
@@ -1435,6 +1439,11 @@ static int reload_clients(struct wtc_tmux *tmux)
 	// Now to update the linked lists.
 	struct wtc_tmux_client *prev;
 	struct wtc_tmux_session *sess;
+	// First clear the current associations.
+	for (sess = tmux->sessions; sess; sess = sess->hh.next)
+		sess->clients = NULL;
+	// Now fill in the new ones (unlike with the other types, clients aren't
+	// sorted by session)
 	for (int i = 0; i < count; ++i) {
 		HASH_FIND(hh, tmux->clients, names[i], strlen(names[i]), client);
 		if (!client) {
@@ -1449,8 +1458,12 @@ static int reload_clients(struct wtc_tmux *tmux)
 				goto err_ids;
 			}
 
-			prev = NULL;
-			sess->clients = client;
+			if (sess->clients) {
+				for (prev = sess->clients; prev->next; prev = prev->next) ;
+			} else {
+				prev = NULL;
+				sess->clients = client;
+			}
 		}
 
 		if (prev) {
@@ -1517,6 +1530,7 @@ static int reload_sessions(struct wtc_tmux *tmux)
 		}
 
 		HASH_DEL(tmux->sessions, sess);
+		free(sess->windows);
 		free(sess); // TODO possible ref count?
 
 		icont: ;
@@ -1582,8 +1596,6 @@ static int reload_sessions(struct wtc_tmux *tmux)
 			// we've just gone and mucked things up pretty badly, but
 			// what can you do?
 			goto err_sids;
-
-		printf("$%u -- %u\n", sess->id, sess->statusbar);
 	}
 
 	r = reload_windows(tmux);

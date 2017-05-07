@@ -98,22 +98,12 @@ struct wtc_tmux_pane
  * Describes a tmux window. A window represents the full screen being shown
  * to a session and is comprised of multiple panes which handle the actual
  * content. A window is associated with a unique session group but not
- * necessarily a unique session. wtc_tmux_windows constitute a doubly linked
- * list which contain the windows associated with a given session group.
+ * necessarily a unique session.
  */
 struct wtc_tmux_window
 {
 	/* The window's tmux id. */
 	int id;
-
-	/*
-	 * The adjacent windows in the linked list. These windows are guaranteed
-	 * to be in the same session group, but there is no guarantee on the
-	 * specifics of the order. These will be NULL if this is the first or
-	 * last window in the list respectively.
-	 */
-	struct wtc_tmux_window *previous;
-	struct wtc_tmux_window *next;
 
 	/* The active pane in the window. */
 	struct wtc_tmux_pane *active_pane;
@@ -135,13 +125,13 @@ struct wtc_tmux_window
  * windows, one of which is marked active. Clients connect to a session. A
  * session can have an arbitrary amount of connected clients. Each client
  * will view the same content---the active window. Although each session has
- * a unique active window, several sessions can constitute a session group
- * in which case every session in the same group will share the same
- * windows. So, whether or not a window is active depends not on the window
- * but on which session it is associated with as well. Thus, unlike with
- * panes, wtc_tmux_window does not have an active property. To determine if
- * a window is active with respect to a session, check if it is the window
- * pointed to by active_window.
+ * a unique active window, several sessions can share a window (and in fact
+ * one session can have the same window multiple times), so whether or not
+ * a window is active depends on which session it is with respect to. In
+ * fact this ambiguity with sessions and windows means that we can't even
+ * sort the windows into linked lists with respect to sessions (like how
+ * clients and panes are a linked list). Instead each session maintains an
+ * array of its windows which is independent from the other windows.
  */
 struct wtc_tmux_session
 {
@@ -167,7 +157,7 @@ struct wtc_tmux_session
 	 * wtc_tmux_window->next you can iterate through all of the windows
 	 * associated with this session.
 	 */
-	struct wtc_tmux_window *windows;
+	struct wtc_tmux_window **windows;
 
 	/*
 	 * The first client linked with this session. Using
