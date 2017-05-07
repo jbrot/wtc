@@ -36,6 +36,9 @@
  * specific error codes.
  */
 
+#ifndef WTC_TMUX_H
+#define WTC_TMUX_H
+
 #include <stdbool.h>
 
 #include "uthash.h"
@@ -401,3 +404,5 @@ wtc_tmux_lookup_pane(const struct wtc_tmux *tmux, int id);
  */
 const struct wtc_tmux_session *
 wtc_tmux_root_session(const struct wtc_tmux *tmux);
+
+#endif // !WTC_TMUX_H

@@ -84,6 +84,34 @@ struct wtc_tmux {
 	struct wtc_tmux_cbs cbs;
 };
 
+static void wtc_tmux_pane_free(struct wtc_tmux_pane *pane)
+{
+	free(pane);
+}
+
+static void wtc_tmux_window_free(struct wtc_tmux_window *window)
+{
+	free(window);
+}
+
+static void wtc_tmux_session_free(struct wtc_tmux_session *sess)
+{
+	if (!sess)
+		return;
+
+	free(sess->windows);
+	free(sess);
+}
+
+static void wtc_tmux_client_free(struct wtc_tmux_client *client)
+{
+	if (!client)
+		return;
+
+	free((void *) client->name);
+	free(client);
+}
+
 /*
  * Dynamically allocate memory for the specified printf operation and
  * then store the result in it. Returns 0 on success and negative error
@@ -1102,6 +1130,7 @@ static int reload_panes(struct wtc_tmux *tmux)
 	HASH_ITER(hh, tmux->panes, pane, tmp) {
 		pane->previous = NULL;
 		pane->next = NULL;
+		pane->window = NULL;
 
 		found = false;
 		for (int i = 0; i < count; ++i) {
@@ -1115,7 +1144,7 @@ static int reload_panes(struct wtc_tmux *tmux)
 			continue;
 
 		HASH_DEL(tmux->panes, pane);
-		free(pane); // TODO possible ref count?
+		wtc_tmux_pane_free(pane);
 	}
 
 	for (int i = 0; i < count; ++i) {
@@ -1124,7 +1153,7 @@ static int reload_panes(struct wtc_tmux *tmux)
 			continue;
 		}
 
-		// Because of session groups, we don't have a uniqueness guarantee
+		// Because of the windows mess, we don't have a uniqueness guarantee
 		pane = NULL;
 		HASH_FIND_INT(tmux->panes, &pids[i], pane);
 		if (pane)
@@ -1187,6 +1216,7 @@ static int reload_panes(struct wtc_tmux *tmux)
 		}
 
 		wind->pane_count++;
+		pane->window = wind;
 
 		if (active[i])
 			wind->active_pane = pane;
@@ -1277,7 +1307,7 @@ static int reload_windows(struct wtc_tmux *tmux)
 			continue;
 
 		HASH_DEL(tmux->windows, wind);
-		free(wind); // TODO possible ref count?
+		wtc_tmux_window_free(wind);
 	}
 
 	for (int i = 0; i < count; ++i) {
@@ -1286,7 +1316,7 @@ static int reload_windows(struct wtc_tmux *tmux)
 			continue;
 		}
 
-		// Because of session groups, we don't have a uniqueness guarantee
+		// Because of the windows mess, we don't have a uniqueness guarantee
 		wind = NULL;
 		HASH_FIND_INT(tmux->windows, &wids[i], wind);
 		if (wind)
@@ -1301,7 +1331,7 @@ static int reload_windows(struct wtc_tmux *tmux)
 		HASH_ADD_INT(tmux->windows, id, wind);
 	}
 
-	// Now to update the linked lists
+	// Now to update the windows lists
 	int wsize = 0;
 	struct wtc_tmux_window **windows = NULL;
 	struct wtc_tmux_window **windows_tmp = NULL;
@@ -1404,6 +1434,7 @@ static int reload_clients(struct wtc_tmux *tmux)
 	HASH_ITER(hh, tmux->clients, client, tmp) {
 		client->previous = NULL;
 		client->next = NULL;
+		client->session = NULL;
 
 		for (int i = 0; i < count; ++i) {
 			if (client->pid == cpids[i]) {
@@ -1413,7 +1444,7 @@ static int reload_clients(struct wtc_tmux *tmux)
 		}
 
 		HASH_DEL(tmux->clients, client);
-		free(client); // TODO possible ref count?
+		wtc_tmux_client_free(client);
 
 		icont: ;
 	}
@@ -1472,6 +1503,7 @@ static int reload_clients(struct wtc_tmux *tmux)
 			client->previous = prev;
 		}
 
+		client->session = sess;
 		prev = client;
 	}
 
@@ -1531,8 +1563,7 @@ static int reload_sessions(struct wtc_tmux *tmux)
 		}
 
 		HASH_DEL(tmux->sessions, sess);
-		free(sess->windows);
-		free(sess); // TODO possible ref count?
+		wtc_tmux_session_free(sess);
 
 		icont: ;
 	}
@@ -1557,7 +1588,6 @@ static int reload_sessions(struct wtc_tmux *tmux)
 
 	bool gstatus = true;
 	bool gstop = true;
-	printf("count: %d\n", count);
 	if (count) {
 		free(out); out = NULL;
 		r = get_option(tmux, "status", 0,
