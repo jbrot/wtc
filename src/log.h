@@ -26,7 +26,8 @@
 /*
  * wtc - Logging
  *
- * This file provides some simple logging functions.
+ * This file provides some simple logging functions. The standard logging
+ * functions include new lines. The "2" variants do not.
  */
 
 #ifndef WTC_LOGGING_H
@@ -47,10 +48,20 @@ enum wtc_log_level {
 
 void wlog(enum wtc_log_level level, const char *format, ...);
 
+/*
+ * The following three log functions constitute "start", "middle", and
+ * "end". They can be used to print a message in multiple parts. Begin
+ * by calling wlogs. Then call wlogm as many times as necessary. Finally,
+ * call wloge.
+ */
+void wlogs(enum wtc_log_level level, const char *format, ...);
+void wlogm(enum wtc_log_level level, const char *format, ...);
+void wloge(enum wtc_log_level level);
+
 void debug(const char *format, ...);
 void info(const char *format, ...);
-void warning(const char *format, ...);
-void critical(const char *format, ...);
+void warn(const char *format, ...);
+void crit(const char *format, ...);
 void fatal(const char *format, ...);
 
 #endif // !WTC_LOGGING_H

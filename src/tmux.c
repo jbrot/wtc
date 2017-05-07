@@ -26,6 +26,7 @@
 #define _GNU_SOURCE
 
 #include "tmux.h"
+#include "log.h"
 
 #include <assert.h>
 #include <errno.h>
@@ -131,19 +132,25 @@ static int bprintf(char **out, const char *format, ...)
 	flen = vsnprintf(NULL, 0, format, args);
 	va_end(args);
 
-	if (flen < 0)
+	if (flen < 0) {
+		warn("bprintf: Couldn't compute buffer size: %d", flen);
 		return flen;
+	}
 
 	buf = malloc(flen + 1);
-	if (!buf)
+	if (!buf) {
+		crit("bprintf: Couldn't make buffer!");
 		return -ENOMEM;
+	}
 
 	va_start(args, format);
 	flen = vsnprintf(buf, flen + 1, format, args);
 	va_end(args);
 
-	if (flen < 0)
+	if (flen < 0) {
+		warn("bprintf: Couldn't print to buffer: %d", flen);
 		return flen;
+	}
 
 	*out = buf;
 	return 0;
@@ -174,12 +181,15 @@ static int fork_tmux(struct wtc_tmux *tmux, const char *const *cmds,
 		++len;
 
 	char **exc = calloc(len + 1, sizeof(char *));
-	if (!exc)
+	if (!exc) {
+		crit("fork_tmux: Couldn't create exc!");
 		return -ENOMEM;
+	}
 
 	for (i = 0; i < tmux->cmdlen; i++) {
 		exc[i] = strdup(tmux->cmd[i]);
 		if (!exc[i]) {
+			crit("fork_tmux: Couldn't fill exc!");
 			r = -ENOMEM;
 			goto err_exc;
 		}
@@ -187,6 +197,7 @@ static int fork_tmux(struct wtc_tmux *tmux, const char *const *cmds,
 	for ( ; *cmds; ++cmds, ++i) {
 		exc[i] = strdup(*cmds);
 		if (!exc[i]) {
+			crit("fork_tmux: Couldn't fill exc!");
 			r = -ENOMEM;
 			goto err_exc;
 		}
@@ -198,6 +209,7 @@ static int fork_tmux(struct wtc_tmux *tmux, const char *const *cmds,
 	if (fin) {
 		r = pipe2(pin, O_CLOEXEC);
 		if (r < 0) {
+			warn("fork_tmux: Couldn't open fin: %d", errno);
 			r = -errno;
 			goto err_exc;
 		}
@@ -205,6 +217,7 @@ static int fork_tmux(struct wtc_tmux *tmux, const char *const *cmds,
 	if (fout) {
 		r = pipe2(pout, O_CLOEXEC);
 		if (r < 0) {
+			warn("fork_tmux: Couldn't open fout: %d", errno);
 			r = -errno;
 			goto err_pin;
 		}
@@ -212,30 +225,32 @@ static int fork_tmux(struct wtc_tmux *tmux, const char *const *cmds,
 	if (ferr) {
 		r = pipe2(perr, O_CLOEXEC);
 		if (r < 0) {
+			warn("fork_tmux: Couldn't open ferr: %d", errno);
 			r = -errno;
 			goto err_pout;
 		}
 	}
 
-	// TODO: Logging
-	for (int i = 0; exc[i]; ++i) printf("%s ", exc[i]);
-	printf("\n");
+	wlogs(DEBUG, "Forking: ");
+	for (int i = 0; exc[i]; ++i) wlogm(DEBUG, "%s ", exc[i]);
+	wloge(DEBUG);
 
 	pid_t cpid = fork();
 	if (cpid == -1) {
+		warn("fork_tmux: Couldn't fork: %d", errno);
 		r = -errno;
 		goto err_perr;
 	} else if (cpid == 0) { // Child
 		if ((fin  && dup2(pin[0],  STDIN_FILENO)  != STDIN_FILENO)  ||
 		    (fout && dup2(pout[1], STDOUT_FILENO) != STDOUT_FILENO) ||
 		    (ferr && dup2(perr[1], STDERR_FILENO) != STDERR_FILENO)) {
-			int err = errno;
-			fprintf(stderr, "Could not change stdio file descriptors!");
-			_exit(err);
+			crit("Could not change stdio file descriptors: %d", errno);
+			_exit(errno);
 		}
 
 		execv(exc[0], exc);
-		_exit(-errno); // Exec failed
+		crit("Exec failed: %d", errno);
+		_exit(errno); // Exec failed
 	}
 
 	// Parent
@@ -249,12 +264,18 @@ static int fork_tmux(struct wtc_tmux *tmux, const char *const *cmds,
 	if (ferr)
 		*ferr = perr[0];
 
-	if(fin && close(pin[0]))
+	if(fin && close(pin[0])) {
+		warn("Couldn't close fin: %d", errno);
 		r = -errno;
-	if (fout && close(pout[1]) && !r)
-		r = -errno;
-	if (ferr && close(perr[1]) && !r)
-		r = -errno;
+	}
+	if (fout && close(pout[1])) {
+		warn("Couldn't close fout: %d", errno);
+		r = r ? r : -errno;
+	}
+	if (ferr && close(perr[1]) && !r) {
+		warn("Couldn't close ferr: %d", errno);
+		r = r ? r : -errno;
+	}
 
 	return r;
 
@@ -293,13 +314,16 @@ static int read_full(int fd, char **out)
 	char *tmp = NULL;
 	int pos = 0;
 	int len = 256;
-	if (!buf)
+	if (!buf) {
+		crit("read_full: Couldn't create buf!");
 		return -ENOMEM;
+	}
 	while ((r = read(fd, buf + pos, len - pos)) == len - pos) {
 		pos += r;
 		len *= 2;
 		tmp = realloc(buf, len + 1);
 		if (!tmp) {
+			crit("read_full: Couldn't resize buf!");
 			r = -ENOMEM;
 			goto err_buf;
 		}
@@ -307,6 +331,7 @@ static int read_full(int fd, char **out)
 	}
 
 	if (r == -1) {
+		warn("read_full: read error: %d", errno);
 		r = -errno;
 		goto err_buf;
 	}
@@ -361,16 +386,19 @@ static int exec_tmux(struct wtc_tmux *tmux, const char *const *cmds,
 
 	int status = 0;
 	if (waitpid(pid, &status, 0) != pid || r) {
+		if (!r)
+			warn("exec_tmux: waitpid error: %d", errno);
 		r = r ? r : -errno;
 		goto err_fds;
 	}
 	if (!WIFEXITED(status)) {
-		// TODO: Logging
-		printf("Child didn't exit!\n");
+		warn("exec_tmux: Child didn't exit!");
 		r = -EINVAL;
 		goto err_fds;
 	}
 	status = WEXITSTATUS(status);
+	if (status)
+		warn("exec_tmux: Child exit status: %d", status);
 
 	if (out) {
 		r = read_full(fout, out);
@@ -382,10 +410,14 @@ static int exec_tmux(struct wtc_tmux *tmux, const char *const *cmds,
 		r = read_full(ferr, err);
 
 err_fds:
-	if (out && close(fout) && !r)
-		r = -errno;
-	if (err && close(ferr) && !r)
-		r = -errno;
+	if (out && close(fout)) {
+		warn("exec_tmux: Error closing fout: %d", fout);
+		r = r ? r : -errno;
+	}
+	if (err && close(ferr) && !r) {
+		warn("exec_tmux: Error closing fout: %d", fout);
+		r = r ? r : -errno;
+	}
 	return r ? r : status;
 }
 
@@ -452,8 +484,10 @@ static int get_option(struct wtc_tmux *tmux, const char *name,
 int wtc_tmux_new(struct wtc_tmux **out)
 {
 	struct wtc_tmux *output = calloc(1, sizeof(*output));
-	if (!output)
+	if (!output) {
+		crit("wtc_tmux_new: Couldn't allocate tmux object!");
 		return -ENOMEM;
+	}
 
 	output->ref = 1;
 
@@ -486,7 +520,30 @@ void wtc_tmux_unref(struct wtc_tmux *tmux)
 	if (!tmux || !tmux->ref || tmux->ref--)
 		return;
 
-	// TODO Cleanup
+	struct wtc_tmux_pane *pane, *tmpp;
+	HASH_ITER(hh, tmux->panes, pane, tmpp) {
+		HASH_DEL(tmux->panes, pane);
+		wtc_tmux_pane_free(pane);
+	}
+
+	struct wtc_tmux_window *window, *tmpw;
+	HASH_ITER(hh, tmux->windows, window, tmpw) {
+		HASH_DEL(tmux->windows, window);
+		wtc_tmux_window_free(window);
+	}
+
+	struct wtc_tmux_session *sess, *tmps;
+	HASH_ITER(hh, tmux->sessions, sess, tmps) {
+		HASH_DEL(tmux->sessions, sess);
+		wtc_tmux_session_free(sess);
+	}
+
+	struct wtc_tmux_client *client, *tmpc;
+	HASH_ITER(hh, tmux->clients, client, tmpc) {
+		HASH_DEL(tmux->clients, client);
+		wtc_tmux_client_free(client);
+	}
+
 	for (int i = 0; i < tmux->cmdlen; ++i)
 		if (cmd_freeable(tmux, tmux->cmd[i]))
 			free(tmux->cmd[i]);
@@ -511,8 +568,10 @@ int wtc_tmux_set_bin_file(struct wtc_tmux *tmux, const char *path)
 	char *dup = NULL;
 	if (path) {
 		dup = strdup(path);
-		if (!dup)
+		if (!dup) {
+			crit("wtc_tmux_set_bin_file: Couldn't duplicate path!");
 			return -ENOMEM;
+		}
 	}
 
 	free(tmux->bin);
@@ -541,8 +600,10 @@ int wtc_tmux_set_socket_name(struct wtc_tmux *tmux, const char *name)
 	}
 
 	char *dup = strdup(name);
-	if (!dup)
+	if (!dup) {
+		crit("wtc_tmux_set_socket_name: Couldn't duplicate name!");
 		return -ENOMEM;
+	}
 
 	free(tmux->socket);
 	tmux->socket = dup;
@@ -568,8 +629,10 @@ int wtc_tmux_set_socket_path(struct wtc_tmux *tmux, const char *path)
 	}
 
 	char *dup = strdup(path);
-	if (!dup)
+	if (!dup) {
+		crit("wtc_tmux_set_socket_path: Couldn't duplicate path!");
 		return -ENOMEM;
+	}
 
 	free(tmux->socket_path);
 	tmux->socket_path = dup;
@@ -606,8 +669,10 @@ int wtc_tmux_set_config_file(struct wtc_tmux *tmux, const char *file)
 	char *dup = NULL;
 	if (file) {
 		dup = strdup(file);
-		if (!dup)
+		if (!dup) {
+			crit("wtc_tmux_set_config_file: Couldn't duplicate file name!");
 			return -ENOMEM;
+		}
 	}
 
 	free(tmux->config);
@@ -652,8 +717,10 @@ static int parselni(const char *fmt, char *str, int *olen, int **out)
 		count += str[i] == '\n';
 
 	int *is = calloc(count, sizeof(int));
-	if (!is)
+	if (!is) {
+		crit("parselni: couldn't allocate is!");
 		return -ENOMEM;
+	}
 
 	count = 0;
 	char *svptr = NULL;
@@ -661,7 +728,8 @@ static int parselni(const char *fmt, char *str, int *olen, int **out)
 	int linec = 0;
 	while (pos != NULL) {
 		r = sscanf(pos, fmt, &is[count], &linec);
-		if (r != 1 || linec != strlen(pos)) { // Parse error
+		if (r != 1 || linec != strlen(pos)) {
+			warn("parselni: Parse error!");
 			r = -EINVAL;
 			goto err_is;
 		}
@@ -697,17 +765,21 @@ static int parselniii(const char *fmt, char *str, int *olen,
 		count += str[i] == '\n';
 
 	int *is = calloc(count, sizeof(int));
-	if (!is)
+	if (!is) {
+		crit("parselniii: couldn't allocate is!");
 		return -ENOMEM;
+	}
 
 	int *is2 = calloc(count, sizeof(int));
 	if (!is2) {
+		crit("parselniii: couldn't allocate is2!");
 		r = -ENOMEM;
 		goto err_is;
 	}
 
 	int *is3 = calloc(count, sizeof(int));
 	if (!is3) {
+		crit("parselniii: couldn't allocate is3!");
 		r = -ENOMEM;
 		goto err_is2;
 	}
@@ -719,7 +791,8 @@ static int parselniii(const char *fmt, char *str, int *olen,
 	while (pos != NULL) {
 		r = sscanf(pos, fmt, &is[count], &is2[count], 
 		           &is3[count], &linec);
-		if (r != 3 || linec != strlen(pos)) { // Parse error
+		if (r != 3 || linec != strlen(pos)) {
+			warn("parselniii: Parse error!");
 			r = -EINVAL;
 			goto err_is3;
 		}
@@ -770,17 +843,21 @@ static int parselniis(const char *fmt, char *str, int *olen,
 	mxl++; // For '\0'
 
 	int *is = calloc(count, sizeof(int));
-	if (!is)
+	if (!is) {
+		crit("parselniis: Couldn't allocate is!");
 		return -ENOMEM;
+	}
 
 	int *is2 = calloc(count, sizeof(int));
 	if (!is2) {
+		crit("parselniis: Couldn't allocate is2!");
 		r = -ENOMEM;
 		goto err_is;
 	}
 
 	char **ss = calloc(count, sizeof(char *));
 	if (!ss) {
+		crit("parselniis: Couldn't allocate ss!");
 		r = -ENOMEM;
 		goto err_is2;
 	}
@@ -796,7 +873,8 @@ static int parselniis(const char *fmt, char *str, int *olen,
 	int linec = 0;
 	while (pos != NULL) {
 		r = sscanf(pos, fmt, &is[ncount], &is2[ncount], &linec);
-		if (r != 2) { // Parse error
+		if (r != 2) {
+			warn("parselniis: Parse error!");
 			r = -EINVAL;
 			goto err_ss;
 		}
@@ -847,8 +925,10 @@ static int version_check(struct wtc_tmux *tmux)
 	// from the version. We assume here the version has no
 	// space in it.
 	char *vst = strrchr(out, ' ');
-	if (!vst) // This really shouldn't happen.
+	if (!vst) {
+		warn("version_check: No space in version string!");
 		goto done;
+	}
 	++vst; // To get the start of the version string
 
 	// The master branch should be good.
@@ -891,6 +971,7 @@ static int update_session_status(struct wtc_tmux *tmux,
 	} else if (strcmp(out, "") == 0) {
 		status = gstatus;
 	} else {
+		warn("update_session_status: Invalid status value: %s", out);
 		r = -EINVAL;
 		goto err_out;
 	}
@@ -907,6 +988,8 @@ static int update_session_status(struct wtc_tmux *tmux,
 	} else if (strcmp(out, "") == 0) {
 		top = gstop;
 	} else {
+		warn("update_session_status: Invalid status-position value: %s",
+		     out);
 		r = -EINVAL;
 		goto err_out;
 	}
@@ -1082,8 +1165,10 @@ static int reload_panes_cb(int pid, int x, int y, int w, int h, void *ud)
 	struct wtc_tmux_pane *pane;
 	HASH_FIND_INT(tmux->panes, &pid, pane);
 
-	if (!pane)
+	if (!pane) {
+		warn("reload_panes_cb: Couldn't find pane %d!", pid);
 		return -EINVAL;
+	}
 
 	pane->x = x;
 	pane->y = y;
@@ -1161,6 +1246,7 @@ static int reload_panes(struct wtc_tmux *tmux)
 
 		pane = calloc(1, sizeof(struct wtc_tmux_pane));
 		if (!pane) {
+			crit("reload_panes: Couldn't create pane!");
 			r = -ENOMEM;
 			goto err_pids;
 		}
@@ -1180,6 +1266,7 @@ static int reload_panes(struct wtc_tmux *tmux)
 		if (i == 0 || wids[i] != wids[i - 1]) {
 			HASH_FIND_INT(tmux->windows, &wids[i], wind);
 			if (!wind) {
+				warn("reload_panes: Couldn't find window %d!", wids[i]);
 				r = -EINVAL;
 				goto err_pids;
 			}
@@ -1193,6 +1280,7 @@ static int reload_panes(struct wtc_tmux *tmux)
 
 		HASH_FIND_INT(tmux->panes, &pids[i], pane);
 		if (!pane) {
+			warn("reload_panes: Couldn't find pane %d!", pids[i]);
 			r = -EINVAL;
 			goto err_pids;
 		}
@@ -1243,8 +1331,10 @@ static int reload_panes(struct wtc_tmux *tmux)
 	char *token = strtok_r(out, "\n", &saveptr);
 	while (token != NULL) {
 		r = process_layout(token, tmux, reload_panes_cb);
-		if (r < 0)
+		if (r < 0) {
+			warn("reload_panes: Layout processing error: %d", r);
 			goto err_pids;
+		}
 
 		token = strtok_r(NULL, "\n", &saveptr);
 	}
@@ -1316,7 +1406,7 @@ static int reload_windows(struct wtc_tmux *tmux)
 			continue;
 		}
 
-		// Because of the windows mess, we don't have a uniqueness guarantee
+		// Because of the windows mess, uniqueness isn't guaranteed
 		wind = NULL;
 		HASH_FIND_INT(tmux->windows, &wids[i], wind);
 		if (wind)
@@ -1324,6 +1414,7 @@ static int reload_windows(struct wtc_tmux *tmux)
 
 		wind = calloc(1, sizeof(struct wtc_tmux_window));
 		if (!wind) {
+			crit("reload_windows: Couldn't allocate window!"); 
 			r = -ENOMEM;
 			goto err_wids;
 		}
@@ -1346,6 +1437,7 @@ static int reload_windows(struct wtc_tmux *tmux)
 
 			HASH_FIND_INT(tmux->sessions, &sids[i], sess);
 			if (!sess) {
+				warn("reload_windows: Couldn't find session %d!", sids[i]);
 				r = -EINVAL;
 				goto err_wids;
 			}
@@ -1353,6 +1445,7 @@ static int reload_windows(struct wtc_tmux *tmux)
 			sess->window_count = 0;
 			windows = calloc(4, sizeof(*windows));
 			if (!windows) {
+				crit("reload_windows: Couldn't allocate windows list!"); 
 				r = -ENOMEM;
 				goto err_wids;
 			}
@@ -1361,6 +1454,7 @@ static int reload_windows(struct wtc_tmux *tmux)
 
 		HASH_FIND_INT(tmux->windows, &wids[i], wind);
 		if (!wind) {
+			warn("reload_windows: Couldn't find window %d!", wids[i]); 
 			r = -EINVAL;
 			goto err_windows;
 		}
@@ -1373,6 +1467,7 @@ static int reload_windows(struct wtc_tmux *tmux)
 			wsize *= 2;
 			windows_tmp = realloc(windows, wsize * sizeof(*windows));
 			if (!windows_tmp) {
+				crit("reload_windows: COuldn't resize windows list!");
 				r = -ENOMEM;
 				goto err_windows;
 			}
@@ -1455,12 +1550,14 @@ static int reload_clients(struct wtc_tmux *tmux)
 
 		client = calloc(1, sizeof(struct wtc_tmux_client));
 		if (!client) {
+			crit("reload_clients: Couldn't create client!");
 			r = -ENOMEM;
 			goto err_ids;
 		}
 		client->pid = cpids[i];
 		client->name = strdup(names[i]);
 		if (!client->name) {
+			crit("reload_clients: Couldn't create client name!");
 			r = -ENOMEM;
 			goto err_ids;
 		}
@@ -1479,6 +1576,7 @@ static int reload_clients(struct wtc_tmux *tmux)
 	for (int i = 0; i < count; ++i) {
 		HASH_FIND(hh, tmux->clients, names[i], strlen(names[i]), client);
 		if (!client) {
+			warn("reload_clients: Couldn't find client \"%s\"!", names[i]);
 			r = -EINVAL;
 			goto err_ids;
 		}
@@ -1486,6 +1584,7 @@ static int reload_clients(struct wtc_tmux *tmux)
 		if (i == 0 || sids[i] != sids[i - 1]) {
 			HASH_FIND_INT(tmux->sessions, &sids[i], sess);
 			if (!sess) {
+				warn("reload_clients: Couldn't find session %d!", sids[i]);
 				r = -EINVAL;
 				goto err_ids;
 			}
@@ -1574,11 +1673,7 @@ static int reload_sessions(struct wtc_tmux *tmux)
 
 		sess = calloc(1, sizeof(struct wtc_tmux_session));
 		if (!sess) {
-			// In an ideal world, we'd make all the changes to a temp copy
-			// so that the state is unaffected in the even of failure.
-			// However, that's way too much work in this case and since the
-			// error is OOM, there's not really much hope for recovery so
-			// it's not that big of a deal.
+			crit("reload_sessions: Couldn't allocate session!");
 			r = -ENOMEM;
 			goto err_sids;
 		}
@@ -1600,6 +1695,7 @@ static int reload_sessions(struct wtc_tmux *tmux)
 		} else if (strncmp(out, "off", 3) == 0) {
 			gstatus = false;
 		} else {
+			warn("reload_sessions: Invalid global status value: %s", out);
 			r = -EINVAL;
 			goto err_sids;
 		}
@@ -1615,6 +1711,8 @@ static int reload_sessions(struct wtc_tmux *tmux)
 		} else if (strncmp(out, "bottom", 6) == 0) {
 			gstop = false;
 		} else {
+			warn("reload_sessions: Invalid global status-position "
+			     "value: %s", out);
 			r = -EINVAL;
 			goto err_sids;
 		}
@@ -1623,9 +1721,6 @@ static int reload_sessions(struct wtc_tmux *tmux)
 	for (sess = tmux->sessions; sess; sess = sess->hh.next) {
 		r = update_session_status(tmux, sess, gstatus, gstop);
 		if (r)
-			// In this case, the error might be something recoverable and
-			// we've just gone and mucked things up pretty badly, but
-			// what can you do?
 			goto err_sids;
 	}
 
@@ -1651,12 +1746,15 @@ static int update_cmd(struct wtc_tmux *tmux)
 	               + (tmux->config ? 2 : 0);
 
 	char **cmd = calloc(cmdlen, sizeof(char *));
-	if (!cmd)
+	if (!cmd) {
+		crit("update_cmd: Couldn't allocate cmd!");
 		return -ENOMEM;
+	}
 
 	if (!tmux->bin) {
 		tmux->bin = strdup("/usr/bin/tmux");
 		if (!tmux->bin) {
+			crit("update_cmd: Couldn't duplicate default bin!");
 			r = -ENOMEM;
 			goto err_cmd;
 		}
@@ -1667,6 +1765,7 @@ static int update_cmd(struct wtc_tmux *tmux)
 		if (tmux->socket) {
 			cmd[++i] = strdup("-L");
 			if (!cmd[i]) {
+				crit("update_cmd: Couldn't duplicate -L");
 				r = -ENOMEM;
 				goto err_cmd;
 			}
@@ -1674,6 +1773,7 @@ static int update_cmd(struct wtc_tmux *tmux)
 		} else {
 			cmd[++i] = strdup("-S");
 			if (!cmd[i]) {
+				crit("update_cmd: Couldn't duplicate -S");
 				r = -ENOMEM;
 				goto err_cmd;
 			}
@@ -1684,6 +1784,7 @@ static int update_cmd(struct wtc_tmux *tmux)
 	if (tmux->config) {
 		cmd[++i] = strdup("-f");
 		if (!cmd[i]) {
+			crit("update_cmd: Couldn't duplicate -f");
 			r = -ENOMEM;
 			goto err_cmd;
 		}
@@ -1724,9 +1825,8 @@ int wtc_tmux_connect(struct wtc_tmux *tmux)
 	r = version_check(tmux);
 	switch (r) {
 	case 0:
-		// TODO Logging
-		fprintf(stderr, "Invalid tmux version! tmux must either be version "
-		                "'master' or newer than version '2.4'\n");
+		crit("Invalid tmux version! tmux must either be version 'master' "
+		     "or newer than version '2.4'");
 		return -1;
 	case 1:
 		r = 0;
