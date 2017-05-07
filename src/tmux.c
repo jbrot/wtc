@@ -311,6 +311,7 @@ err_buf:
  * on that stream and no errors were detected while processing it.
  *
  * TODO handle timeout
+ * TODO use control session isntead of new process if possible.
  */
 static int exec_tmux(struct wtc_tmux *tmux, const char *const *cmds,
                      char **out, char **err)
@@ -364,8 +365,8 @@ err_fds:
  * Retrieve the value of the option specified by name. The trailing newline
  * will be omitted in *out. Mode can be a bitwise or of several of the
  * gollowing flags. If the global or server flags are set, then target is
- * ignored. If the session flag is set, then target will be used to determine
- * which session to query and likewise for the window flag.
+ * ignored. If the session flag is set, then target will be used to 
+ * determine which session to query and likewise for the window flag.
  *
  * Note that out must be non-NULL and *out must be NULL.
  */
@@ -591,97 +592,6 @@ const char *wtc_tmux_get_config_file(const struct wtc_tmux *tmux)
 }
 
 /*
- * Ensures the version of tmux is new enough to support the needed messages.
- * Returns 1 if the versions is new enough and 0 if it is not. Will return
- * a negative error code if something goes wrong checking the version.
- */
-static int version_check(struct wtc_tmux *tmux)
-{
-	int r = 0;
-	const char *const cmd[] = { "-V", NULL };
-	char *out = NULL;
-	r = exec_tmux(tmux, cmd, &out, NULL);
-	if (r != 0)
-		goto done;
-
-	// We have a guarantee from the source that the version
-	// string contains a space separating the program name
-	// from the version. We assume here the version has no
-	// space in it.
-	char *vst = strrchr(out, ' ');
-	if (!vst) // This really shouldn't happen.
-		goto done;
-	++vst; // To get the start of the version string
-
-	// The master branch should be good.
-	if (strncmp(vst, "master", 6) == 0) {
-		r = 1;
-		goto done;
-	}
-
-	// Process the version as a double. This may not process the entire
-	// version but it should give us a good enough guess to ensure we're
-	// past version 2.4. As future versions come out, we may need more cases
-	// here.
-	double version = atof(vst);
-	if (version > 2.4)
-		r = 1;
-
-done:
-	free(out);
-	return r;
-}
-
-/*
- * Update the information on the sessions' status bar.
- */
-static int update_session_status(struct wtc_tmux *tmux,
-                                 struct wtc_tmux_session *sess,
-                                 bool gstatus, bool gstop)
-{
-	int r = 0;
-	char *out = NULL;
-	bool status, top;
-
-	r = get_option(tmux, "status", sess->id, WTC_TMUX_OPTION_SESSION, &out);
-	if (r)
-		goto err_out;
-	if (strncmp(out, "on", 2) == 0) {
-		status = true;
-	} else if (strncmp(out, "off", 3) == 0) {
-		status = false;
-	} else if (strcmp(out, "") == 0) {
-		status = gstatus;
-	} else {
-		r = -EINVAL;
-		goto err_out;
-	}
-
-	free(out); out = NULL;
-	r = get_option(tmux, "status-position", sess->id,
-	               WTC_TMUX_OPTION_SESSION, &out);
-	if (r)
-		goto err_out;
-	if (strncmp(out, "top", 3) == 0) {
-		top = true;
-	} else if (strncmp(out, "bottom", 6) == 0) {
-		top = false;
-	} else if (strcmp(out, "") == 0) {
-		top = gstop;
-	} else {
-		r = -EINVAL;
-		goto err_out;
-	}
-
-	sess->statusbar = !status ? WTC_TMUX_SESSION_OFF :
-	                   top ? WTC_TMUX_SESSION_TOP : WTC_TMUX_SESSION_BOTTOM;
-
-err_out:
-	free(out);
-	return r;
-}
-
-/*
  * The following functions all parse the input string str line by line
  * per a format string fmt. What gets parsed in each line varies from
  * function to function. The number of lines parsed is put into *olen
@@ -891,6 +801,271 @@ err_is:
 }
 
 /*
+ * Ensures the version of tmux is new enough to support the needed messages.
+ * Returns 1 if the versions is new enough and 0 if it is not. Will return
+ * a negative error code if something goes wrong checking the version.
+ */
+static int version_check(struct wtc_tmux *tmux)
+{
+	int r = 0;
+	const char *const cmd[] = { "-V", NULL };
+	char *out = NULL;
+	r = exec_tmux(tmux, cmd, &out, NULL);
+	if (r != 0)
+		goto done;
+
+	// We have a guarantee from the source that the version
+	// string contains a space separating the program name
+	// from the version. We assume here the version has no
+	// space in it.
+	char *vst = strrchr(out, ' ');
+	if (!vst) // This really shouldn't happen.
+		goto done;
+	++vst; // To get the start of the version string
+
+	// The master branch should be good.
+	if (strncmp(vst, "master", 6) == 0) {
+		r = 1;
+		goto done;
+	}
+
+	// Process the version as a double. This may not process the entire
+	// version but it should give us a good enough guess to ensure we're
+	// past version 2.4. As future versions come out, we may need more cases
+	// here.
+	double version = atof(vst);
+	if (version > 2.4)
+		r = 1;
+
+done:
+	free(out);
+	return r;
+}
+
+/*
+ * Update the information on the sessions' status bar.
+ */
+static int update_session_status(struct wtc_tmux *tmux,
+                                 struct wtc_tmux_session *sess,
+                                 bool gstatus, bool gstop)
+{
+	int r = 0;
+	char *out = NULL;
+	bool status, top;
+
+	r = get_option(tmux, "status", sess->id, WTC_TMUX_OPTION_SESSION, &out);
+	if (r)
+		goto err_out;
+	if (strncmp(out, "on", 2) == 0) {
+		status = true;
+	} else if (strncmp(out, "off", 3) == 0) {
+		status = false;
+	} else if (strcmp(out, "") == 0) {
+		status = gstatus;
+	} else {
+		r = -EINVAL;
+		goto err_out;
+	}
+
+	free(out); out = NULL;
+	r = get_option(tmux, "status-position", sess->id,
+	               WTC_TMUX_OPTION_SESSION, &out);
+	if (r)
+		goto err_out;
+	if (strncmp(out, "top", 3) == 0) {
+		top = true;
+	} else if (strncmp(out, "bottom", 6) == 0) {
+		top = false;
+	} else if (strcmp(out, "") == 0) {
+		top = gstop;
+	} else {
+		r = -EINVAL;
+		goto err_out;
+	}
+
+	sess->statusbar = !status ? WTC_TMUX_SESSION_OFF :
+	                   top ? WTC_TMUX_SESSION_TOP : WTC_TMUX_SESSION_BOTTOM;
+
+err_out:
+	free(out);
+	return r;
+}
+
+/*
+ * strtokd functions identically to strtok_r except that the character
+ * which is overwritten to makr the end of the token is stored in fdelim.
+ *
+ * delim and saveptr must not be NULL. fdelim may be NULL (in which case
+ * the changed token will not be stored)
+ */
+static char *strtokd(char *str, const char *delim, 
+                     char **saveptr, char *fdelim)
+{
+	char *startptr = str ? str : *saveptr;
+	// Find the first character past startptr which isn't in deliml If there
+	// isn't one, return NULL.
+	while (true) {
+		if (*startptr == '\0')
+			return NULL;
+
+		for (int i = 0; delim[i] != '\0'; ++i) {
+			if (*startptr == delim[i]) {
+				++startptr;
+				goto wcont;
+			}
+		}
+
+		break;
+
+		wcont: ;
+	}
+
+	for (*saveptr = startptr + 1; **saveptr != '\0'; (*saveptr)++) {
+		for (int i = 0; delim[i] != '\0'; ++i) {
+			if (**saveptr != delim[i])
+				continue;
+
+			if (fdelim)
+				*fdelim = delim[i];
+
+			**saveptr = '\0';
+			(*saveptr)++; // So we don't trip up on the '\0' next time
+
+			goto out;
+		}
+	}
+
+out:
+	return startptr;
+}
+
+/*
+ * Basic positive integer parsing function, in the vain of atoi. If the 
+ * string contains a character other than 0-9, returns -1. If the string
+ * is empty, returns -1. If the string will overflow an int, returns -1.
+ */
+static int parseint(const char *str)
+{
+	int ret = 0;
+	if (*str == '\0')
+		return -1;
+
+	for ( ; *str != '\0'; str++) {
+		if (*str < '0' || *str > '9')
+			return -1;
+		ret = 10 * ret + (*str - '0');
+		if (ret < 0) // Overflow
+			return -1;
+	}
+
+	return ret;
+}
+
+/*
+ * Process the given layout string. Whenever the full information regarding
+ * a pane is determined, the provided call back will be invoked with the
+ * given information. Note that layout will be processed via strtokd and
+ * so will be changed after a call to this function. If layout cannot be
+ * changed, make a copy before calling.
+ *
+ * Returns 0 on success and -EINVAL on a parse error. If the callback
+ * returns non-zero, parsing will be aborted this function will return 
+ * the callback's return value.
+ */
+static int process_layout(char *layout, void *userdata,
+	int (*cb)(int pid, int x, int y, int w, int h, void *userdata))
+{
+	char delim;
+	char *saveptr;
+	char *token = strtokd(layout, ",x[]{}", &saveptr, &delim);
+	if (!token || delim != ',') // Skip the checksum
+		return -EINVAL;
+
+	int w, h, x, y, id;
+	int state = 0;
+	int r = 0;
+	while (token = strtokd(NULL, ",x[]{}", &saveptr, &delim)) {
+		switch(state) {
+		case 0: // width
+			if (delim != 'x')
+				return -EINVAL;
+
+			w = parseint(token);
+			if (w < 0)
+				return -EINVAL;
+
+			state = 1;
+			break;
+		case 1: // height
+			if (delim != ',')
+				return -EINVAL;
+
+			h = parseint(token);
+			if (h < 0)
+				return -EINVAL;
+
+			state = 2;
+			break;
+		case 2: // x
+			if (delim != ',')
+				return -EINVAL;
+
+			x = parseint(token);
+			if (x < 0)
+				return -EINVAL;
+
+			state = 3;
+			break;
+		case 3: // y
+			if (delim != ',') { // Larger structure, not actual pane
+				state = 0;
+				break;
+			}
+
+			y = parseint(token);
+			if (y < 0)
+				return -EINVAL;
+
+			state = 4;
+			break;
+		case 4: // pid
+			if (delim == 'x' || delim == '[' || delim == '{')
+				return -EINVAL;
+
+			id = parseint(token);
+			if (id < 0)
+				return -EINVAL;
+
+			r = cb(id, x, y, w, h, userdata);
+			if (r)
+				return r;
+
+			state = 0;
+			break;
+		}
+	}
+
+	return 0;
+}
+
+static int reload_panes_cb(int pid, int x, int y, int w, int h, void *ud)
+{
+	struct wtc_tmux *tmux = ud;
+	struct wtc_tmux_pane *pane;
+	HASH_FIND_INT(tmux->panes, &pid, pane);
+
+	if (!pane)
+		return -EINVAL;
+
+	pane->x = x;
+	pane->y = y;
+	pane->w = w;
+	pane->h = h;
+
+	return 0;
+}
+
+/*
  * Reload the panes on the server. Note that, when calling this, it is
  * imperative that the windows are already up to date. Depending on where
  * this fails, the server representation may be left in a corrupted state
@@ -1017,7 +1192,24 @@ static int reload_panes(struct wtc_tmux *tmux)
 		prev = pane;
 	}
 
-	// TODO deal with layout
+	cmd[0] = "list-windows";
+	cmd[1] = "-aF";
+	cmd[2] = "#{window_visible_layout}";
+	cmd[3] = NULL;
+	free(out); out = NULL;
+	r = exec_tmux(tmux, cmd, &out, NULL);
+	if (r < 0) // We swallow non-zero exit to handle no server being up
+		goto err_pids;
+
+	char *saveptr;
+	char *token = strtok_r(out, "\n", &saveptr);
+	while (token != NULL) {
+		r = process_layout(token, tmux, reload_panes_cb);
+		if (r < 0)
+			goto err_pids;
+
+		token = strtok_r(NULL, "\n", &saveptr);
+	}
 
 err_pids:
 	free(pids);

@@ -191,7 +191,7 @@ struct wtc_tmux_session
 struct wtc_tmux_client
 {
 	/* The client's pid. */
-	int pid;
+	pid_t pid;
 	/* The client's name. */
 	const char *name;
 
