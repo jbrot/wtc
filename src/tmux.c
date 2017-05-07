@@ -1207,6 +1207,7 @@ static int reload_panes(struct wtc_tmux *tmux)
 	r = exec_tmux(tmux, cmd, &out, NULL);
 	if (r < 0) // We swallow non-zero exit to handle no server being up
 		goto err_pids;
+	r = 0; // Actually swallow as we don't necessarily have a next call
 
 	char *saveptr;
 	char *token = strtok_r(out, "\n", &saveptr);
