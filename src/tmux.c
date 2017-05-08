@@ -75,6 +75,7 @@ struct wtc_tmux_cc {
 	bool temp;
 	int fin;
 	struct wlc_event_source *outs;
+	char *buf;
 
 	struct wtc_tmux_cc *previous;
 	struct wtc_tmux_cc *next;
@@ -363,31 +364,80 @@ err_exc:
 }
 
 /*
- * Read the available contents of the fd into a newly allocated buffer.
+ * Calculates the next power of 2. From Sean Eron Anderson's Bit Twiddling
+ * Hacks.
+ */
+static inline unsigned int npo2(unsigned int base) {
+	--base;
+
+	base |= (base >> 1);
+	base |= (base >> 2);
+	base |= (base >> 4);
+	base |= (base >> 8);
+	base |= (base >> 16);
+
+	return ++base;
+}
+
+/*
+ * Read the available contents of the fd into a newly allocated buffer or
+ * at the end of an existing buffer.
+ *
+ * read_available has three basic modes: if out is NULL, then this function
+ * runs in "discard" mode---it simply reads everything available in the fd
+ * and discards it. This can be useful for clearing a buffer. If out is not
+ * NULL but size is NULL, then this function runs in "c string" mode---the
+ * data read into the buffer has '\0' bytes replaced with 0x01 and the a
+ * '\0' character appended to the end making the data read a vaild c string.
+ * Finally, if out is not NULL and size is not NULL, this function runs in
+ * "standard" mode---the data read is put into the buffer unmodified and the
+ * total length of the data read is stored in *out.
+ *
+ * In addition, in "c string" and "standard" mode, read_available can either
+ * read the data into an empty buffer or append it to an existing buffer.
+ * If *out is NULL, then the data will be read into an empty buffer.
+ * However, if *out is not NULL then the data will be appended to the end of
+ * the current contents of *out. In "c string" mode, the end of the current
+ * contents will be detected by iterating through *out until '\0' is found.
+ * The new data will start at the position of the '\0', replacing it. In
+ * "standard" mode, the new data will start at the index specified by *size.
+ * Note that when new data is being appended, the existing buffer is first
+ * copied. Then, if the new read succeeds, the existing buffer is freed and
+ * the pointer to it is set to the new buffer.
+ *
  * Returns 0 on success, otherwise returns a negative error code. Can
  * return -ENOMEM if there are problems allocating the string and any of the
- * error codes from a call to read(). On success the new buffer will be in
- * *out and its size will be in *size. Note that the buffer will always have
- * a \0 appended to it to ensure the buffer is a valid c string, although
- * no guarantee is made that \0 won't be in the buffer earlier hence the
- * size output. If this functions returns an error code, *size and *out
- * will be unchanged. 
- *
- * If out is NULL, the contents of the fd will simply be discarded and size
- * is ignored. If out is not NULL and size is NULL, the size will be
- * discarded.
+ * error codes from a call to read(). If the function is in "standard" mode,
+ * *out is not NULL, and the value of *size is negative, -EINVAL will be
+ * returned. If this function returns non zero, the values of *size and *out
+ * will not be changed.
  */
 static int read_available(int fd, int *size, char **out)
 {
 	int r = 0;
-	char *buf = calloc(257, sizeof(char));
-	char *tmp = NULL;
-	int pos = 0;
-	int len = 256;
+	char *buf, *tmp;
+	int pos, len;
+	// 0 - discard; 1 - c string; 2 - standard
+	int mode = !out ? 0 : size ? 2 : 1;
+	if (mode == 1 && *out) {
+		pos = strlen(*out);
+	} else if (mode == 2 && *out) {
+		pos = *size;
+		if (pos < 0)
+			return -EINVAL;
+	} else {
+		pos = 0;
+	}
+	len = npo2(pos);
+	len = len < 128 ? 128 : len;
+	buf = calloc(len + 1, sizeof(char));
 	if (!buf) {
 		crit("read_available: Couldn't create buf!");
 		return -ENOMEM;
 	}
+	if (pos)
+		memcpy(buf, *out, pos);
+
 	while (true) {
 		r = read(fd, buf + pos, len - pos);
 		if (r == -1) {
@@ -411,9 +461,13 @@ static int read_available(int fd, int *size, char **out)
 		if (pos != len)
 			break;
 
-		if (!out) {
+		if (mode == 0) {
 			pos = 0;
 			continue;
+		} else if (mode == 1) {
+			for (int i = pos - r; i < pos; ++i)
+				if (buf[i] == '\0')
+					buf[i] = 1;
 		}
 
 		len *= 2;
@@ -441,9 +495,12 @@ err_buf:
 }
 
 /*
- * Run the command specified in cmds, wait for it to finish, and
- * store its stdout in out and stderr in err. Out and err may be
- * NULL to indicate the respective streams should be ignored.
+ * Run the command specified in cmds, wait for it to finish, and store its 
+ * stdout in out and stderr in err. Out and err may be NULL to indicate the 
+ * respective streams should be ignored. Out and err will be populated by
+ * read_avilable in "c string" mode. If *out or *err is not NULL, then they
+ * are expected to point to an existing c string. On success the newly read
+ * data will be appended to the existing data.
  *
  * Returns the client exit status (non-negative) or a negative value on
  * failure. Note that failures during closing the fds will not be reported
@@ -540,6 +597,7 @@ static void wtc_tmux_cc_unref(struct wtc_tmux_cc *cc)
 	if (cc->fin != -1 && close(cc->fin))
 			warn("wtc_tmux_cc_unref: Error when closing fin: %d", errno);
 
+	free(cc->buf);
 	free(cc);
 }
 
@@ -601,6 +659,8 @@ static int sigc_cb(int fd, uint32_t mask, void *userdata)
 		for (cc = tmux->ccs; cc; prev = cc, cc = cc->next) {
 			if (cc->pid != pid)
 				continue;
+
+			debug("sigc_cb: Removing child %u", pid);
 
 			if (prev) {
 				prev->next = cc->next;
@@ -2171,8 +2231,14 @@ int wtc_tmux_connect(struct wtc_tmux *tmux)
 	if (r < 0)
 		goto err_sig;
 
-	if (tmux->sessions)
-		r = launch_cc(tmux, tmux->sessions);
+	if (tmux->sessions) {
+		struct wtc_tmux_session *sess;
+		for (sess = tmux->sessions; sess; sess = sess->hh.next) {
+			r = launch_cc(tmux, sess);
+			if (r < 0)
+				fatal("Not sure what to do here yet.");
+		}
+	}
 	return r;
 
 err_sig:
