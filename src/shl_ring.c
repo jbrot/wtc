@@ -7,6 +7,8 @@
 
 #include "shl_ring.h"
 
+#include "log.h"
+
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,8 +24,10 @@ static int ring_resize(struct shl_ring *r, size_t nsize)
 	char *buf;
 
 	buf = malloc(nsize);
-	if (!buf)
+	if (!buf) {
+		crit("ring_resize: Couldn't allocate buf!");
 		return -ENOMEM;
+	}
 
 	if (r->end == r->start) {
 		r->end = 0;
@@ -87,8 +91,11 @@ int shl_ring_grow(struct shl_ring *r, size_t add)
 	len = r->size + add - len + 1;
 	len = ring_pow2(len);
 
-	if (len <= r->size)
+	if (len <= r->size) {
+		warn("shl_ring_grow: Can't add %d bytes to ring, as that overflows "
+		     "size_t!", add);
 		return -ENOMEM;
+	}
 
 	return ring_resize(r, len);
 }
