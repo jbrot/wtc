@@ -65,14 +65,14 @@ struct wtc_tmux_cbs {
 };
 
 struct wtc_tmux_cc {
+	unsigned long ref;
+
 	struct wtc_tmux *tmux;
 	struct wtc_tmux_session *session;
 
 	pid_t pid;
 	bool temp;
 	int fin;
-	struct wlc_event_source *ins;
-	int fout;
 	struct wlc_event_source *outs;
 
 
@@ -191,7 +191,7 @@ static int fork_tmux(struct wtc_tmux *tmux, const char *const *cmds,
                      pid_t *pid, int *fin, int *fout, int *ferr)
 {
 	int i;
-	int r = 0, s = 0;
+	int r = 0;
 
 	if (!tmux || !cmds)
 		return -EINVAL;
@@ -284,7 +284,7 @@ static int fork_tmux(struct wtc_tmux *tmux, const char *const *cmds,
 		if (ferr && r != -1)
 			while ((r = dup2(perr[1], STDERR_FILENO)) == -1 &&
 			       errno == EINTR) ;
-		if (r == -1)
+		if (r == -1) {
 			crit("Could not change stdio file descriptors: %d", errno);
 			_exit(errno);
 		}
@@ -305,55 +305,40 @@ static int fork_tmux(struct wtc_tmux *tmux, const char *const *cmds,
 	if (ferr)
 		*ferr = perr[0];
 
-	if(fin) {
-		while((s = close(pin[0])) == -1 && errno == EINTR) ;
-		if (s == -1) {
-			warn("fork_tmux: Couldn't close fin: %d", errno);
-			r = -errno;
-		}
+	if(fin && close(pin[0]) == -1 && errno != EINTR) {
+		warn("fork_tmux: Couldn't close fin: %d", errno);
+		r = -errno;
 	}
-	if(fout) {
-		while((s = close(pout[1])) == -1 && errno == EINTR) ;
-		if (s == -1) {
-			warn("fork_tmux: Couldn't close fout: %d", errno);
-			r = r ? r : -errno;
-		}
+	if(fout && close(pout[1]) == -1 && errno != EINTR) {
+		warn("fork_tmux: Couldn't close fout: %d", errno);
+		r = r ? r : -errno;
 	}
-	if(ferr) {
-		while((s = close(perr[1])) == -1 && errno == EINTR) ;
-		if (s == -1) {
-			warn("fork_tmux: Couldn't close ferr: %d", errno);
-			r = r ? r : -errno;
-		}
+	if(ferr && close(perr[1]) == -1 && errno != EINTR) {
+		warn("fork_tmux: Couldn't close ferr: %d", errno);
+		r = r ? r : -errno;
 	}
 
 	return r;
 
 err_perr:
 	if (ferr) {
-		while((s = close(perr[0])) == -1 && errno == EINTR) ;
-		if (s == -1)
+		if (close(perr[0]))
 			warn("fork_tmux: Couldn't close perr0: %d", errno);
-		while((s = close(perr[1])) == -1 && errno == EINTR) ;
-		if (s == -1)
+		if (close(perr[1]))
 			warn("fork_tmux: Couldn't close perr1: %d", errno);
 	}
 err_pout:
 	if (fout) {
-		while((s = close(pout[0])) == -1 && errno == EINTR) ;
-		if (s == -1)
+		if (close(pout[0]))
 			warn("fork_tmux: Couldn't close pout0: %d", errno);
-		while((s = close(pout[1])) == -1 && errno == EINTR) ;
-		if (s == -1)
+		if (close(pout[1]))
 			warn("fork_tmux: Couldn't close pout1: %d", errno);
 	}
 err_pin:
 	if (fin) {
-		while((s = close(pin[0])) == -1 && errno == EINTR) ;
-		if (s == -1)
+		if (close(pin[0]))
 			warn("fork_tmux: Couldn't close pin0: %d", errno);
-		while((s = close(pin[1])) == -1 && errno == EINTR) ;
-		if (s == -1)
+		if (close(pin[1]))
 			warn("fork_tmux: Couldn't close pin1: %d", errno);
 	}
 err_exc:
@@ -459,7 +444,7 @@ static int exec_tmux(struct wtc_tmux *tmux, const char *const *cmds,
 	pid_t pid = 0;
 	int fout, ferr;
 	int *pout, *perr;
-	int r = 0, s = 0;
+	int r = 0;
 
 	if (!tmux || !cmds)
 		return -EINVAL;
@@ -499,20 +484,42 @@ static int exec_tmux(struct wtc_tmux *tmux, const char *const *cmds,
 
 err_fds:
 	if (out) {
-		while ((s = close(fout)) == -1 && errno = EINTR) ;
-		if (s == -1) {
+		if (close(fout) == -1 && errno != EINTR) {
 			warn("exec_tmux: Error closing fout: %d", errno);
 			r = r ? r : -errno;
 		}
 	}
 	if (err) {
-		while ((s = close(ferr)) == -1 && errno = EINTR) ;
-		if (s == -1) {
+		if (close(ferr) == -1 && errno != EINTR) {
 			warn("exec_tmux: Error closing ferr: %d", errno);
 			r = r ? r : -errno;
 		}
 	}
 	return r ? r : status;
+}
+
+static void wtc_tmux_cc_ref(struct wtc_tmux_cc *cc)
+{
+	if (!cc|| !cc->ref)
+		return;
+
+	cc->ref++;
+}
+
+static void wtc_tmux_cc_unref(struct wtc_tmux_cc *cc)
+{
+	int s = 0;
+
+	if (!cc || !cc->ref || cc->ref--)
+		return;
+
+	if (cc->outs)
+		wlc_event_source_remove(cc->outs);
+
+	if (cc->fin != -1 && close(cc->fin))
+			warn("wtc_tmux_cc_unref: Error when closing fin: %d", errno);
+
+	free(cc);
 }
 
 static int cc_cb(int fd, uint32_t mask, void *userdata)
@@ -529,12 +536,18 @@ static int cc_cb(int fd, uint32_t mask, void *userdata)
 			warn("Read error: %d", r);
 		free(content);
 	}
-	if (mask & WL_EVENT_WRITABLE)
-		debug("Writeable: %d", fd);
-	if (mask & WL_EVENT_HANGUP)
-		debug("Hang Up: %d", fd);
-	if (mask & WL_EVENT_ERROR)
-		debug("Error: %d", fd);
+	if (mask & (WL_EVENT_HANGUP | WL_EVENT_ERROR)) {
+		if (mask & WL_EVENT_HANGUP)
+			debug("cc_cb: HUP: %d", fd);
+		if (mask & WL_EVENT_ERROR)
+			debug("cc_cb: Error: %d", fd);
+
+		wlc_event_source_remove(cc->outs);
+		cc->outs = NULL;
+		wtc_tmux_cc_unref(cc);
+	}
+
+	return 0;
 }
 
 /*
@@ -544,11 +557,10 @@ static int launch_cc(struct wtc_tmux *tmux, struct wtc_tmux_session *sess)
 {
 	const char *cmd[] = { "-C", "attach-session", "-t", NULL, NULL };
 	char *dyn = NULL;
-	struct wlc_event_source *sin, *sout;
 	struct wtc_tmux_cc *cc, *tmp;
 	int fin, fout;
 	pid_t pid = 0;
-	int r;
+	int r = 0, s = 0;
 
 	if (!tmux || !sess) // TODO Launch new session here if sess is NULL?
 		return -EINVAL;
@@ -569,20 +581,20 @@ static int launch_cc(struct wtc_tmux *tmux, struct wtc_tmux_session *sess)
 	if (!pid)
 		goto err_cc;
 
+	cc->ref = 2; // outs and tmux.
 	cc->tmux = tmux;
 	cc->session = sess;
 
 	cc->pid = pid;
 	cc->temp = false;
 	cc->fin = fin;
-	cc->fout = fout;
 
-	sin = wlc_event_loop_add_fd(fin, WL_EVENT_HANGUP, cc_cb, cc);
-	sout = wlc_event_loop_add_fd(fout, WL_EVENT_READABLE | WL_EVENT_HANGUP,
-	                             cc_cb, cc);
-
-	cc->ins = sin;
-	cc->outs = sout;
+	cc->outs = wlc_event_loop_add_fd(fout, WL_EVENT_READABLE 
+	                                     | WL_EVENT_HANGUP, cc_cb, cc);
+	if (!cc->outs) {
+		warn("launch_cc: Couldn't add fout to event loop!");
+		goto err_pid;
+	}
 
 	if (tmux->ccs) {
 		for (tmp = tmux->ccs; tmp->next; tmp = tmp->next) ;
@@ -592,8 +604,20 @@ static int launch_cc(struct wtc_tmux *tmux, struct wtc_tmux_session *sess)
 		tmux->ccs = cc;
 	}
 
-	cc = NULL;
+	free(dyn);
+	return r;
 
+err_pid:
+	// If we're here, the process is started and we need to stop it...
+	kill(pid, SIGKILL);
+	while ((s = waitpid(pid, NULL, 0)) == -1 && errno == EINTR) ;
+	if (s == -1)
+		warn("launch_cc: waitpid on client failed with %d", errno);
+
+	if (close(fin))
+		warn("launch_cc: error closing fin: %d", errno);
+	if (close(fout))
+		warn("launch_cc: error closing fout: %d", errno);
 err_cc:
 	free(cc);
 err_cmd:
