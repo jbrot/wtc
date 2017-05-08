@@ -371,14 +371,14 @@ err_exc:
  * a \0 appended to it to ensure the buffer is a valid c string, although
  * no guarantee is made that \0 won't be in the buffer earlier hence the
  * size output. If this functions returns an error code, *size and *out
- * will be unchanged. If size is NULL, the parameter will be discarded.
- * If out is NULL -EINVAL will be returned.
+ * will be unchanged. 
+ *
+ * If out is NULL, the contents of the fd will simply be discarded and size
+ * is ignored. If out is not NULL and size is NULL, the size will be
+ * discarded.
  */
 static int read_available(int fd, int *size, char **out)
 {
-	if (!out)
-		return -EINVAL;
-
 	int r = 0;
 	char *buf = calloc(257, sizeof(char));
 	char *tmp = NULL;
@@ -411,6 +411,11 @@ static int read_available(int fd, int *size, char **out)
 		if (pos != len)
 			break;
 
+		if (!out) {
+			pos = 0;
+			continue;
+		}
+
 		len *= 2;
 		tmp = realloc(buf, len + 1);
 		if (!tmp) {
@@ -423,9 +428,11 @@ static int read_available(int fd, int *size, char **out)
 
 	memset(buf + pos, '\0', len + 1 - pos);
 
-	*out = buf;
-	if (size)
-		*size = pos + 1;
+	if (out) {
+		*out = buf;
+		if (size)
+			*size = pos + 1;
+	}
 	return 0;
 
 err_buf:
@@ -566,7 +573,52 @@ static int cc_cb(int fd, uint32_t mask, void *userdata)
 
 static int sigc_cb(int fd, uint32_t mask, void *userdata)
 {
-	// TODO
+	struct wtc_tmux *tmux = userdata;
+	pid_t pid;
+	int r = 0;
+
+	r = read_available(fd, NULL, NULL);
+	if (r < 0) {
+		warn("sigc_cb: Error clearing SIGCHLD pipe: %d", r);
+		return r;
+	}
+
+	// Because we're handling this synchronously, we don't have to worry
+	// about stealing exec_tmux's waitpid. However, exec_tmux can steal
+	// our waitpid, so instead of having a guarantee of at least 1 child
+	// we don't even have that.
+	struct wtc_tmux_cc *prev, *cc;
+	while (pid = waitpid(-1, NULL, WNOHANG)) {
+		if (r < 0) {
+			if (errno == EINTR)
+				continue;
+
+			warn("sigc_cb: waitpid error: %d", errno);
+			return r;
+		}
+
+		prev = NULL;
+		for (cc = tmux->ccs; cc; prev = cc, cc = cc->next) {
+			if (cc->pid != pid)
+				continue;
+
+			if (prev) {
+				prev->next = cc->next;
+				if (cc->next)
+					cc->next->previous = prev;
+			} else {
+				tmux->ccs = cc->next;
+				if (cc->next)
+					cc->next->previous = NULL;
+				// TODO possible no session handler
+			}
+
+			// TODO possible client disconnect cb
+			wtc_tmux_cc_unref(cc);
+			break;
+		}
+	}
+
 	return 0;
 }
 
