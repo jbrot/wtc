@@ -35,6 +35,8 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <wait.h>
+#include <wayland-server-core.h>
+#include <wlc/wlc.h>
 
 struct wtc_tmux_cbs {
 	void (*new_client)(struct wtc_tmux *tmux,
@@ -62,6 +64,22 @@ struct wtc_tmux_cbs {
 	                          const struct wtc_tmux_pane *pane);
 };
 
+struct wtc_tmux_cc {
+	struct wtc_tmux *tmux;
+	struct wtc_tmux_session *session;
+
+	pid_t pid;
+	bool temp;
+	int fin;
+	struct wlc_event_source *ins;
+	int fout;
+	struct wlc_event_source *outs;
+
+
+	struct wtc_tmux_cc *previous;
+	struct wtc_tmux_cc *next;
+};
+
 struct wtc_tmux {
 	unsigned long ref;
 
@@ -69,6 +87,8 @@ struct wtc_tmux {
 	struct wtc_tmux_window *windows;
 	struct wtc_tmux_session *sessions;
 	struct wtc_tmux_client *clients;
+
+	struct wtc_tmux_cc *ccs;
 
 	char *bin;
 	char *socket;
@@ -171,7 +191,7 @@ static int fork_tmux(struct wtc_tmux *tmux, const char *const *cmds,
                      pid_t *pid, int *fin, int *fout, int *ferr)
 {
 	int i;
-	int r = 0;
+	int r = 0, s = 0;
 
 	if (!tmux || !cmds)
 		return -EINVAL;
@@ -215,23 +235,35 @@ static int fork_tmux(struct wtc_tmux *tmux, const char *const *cmds,
 		}
 	}
 	if (fout) {
-		r = pipe2(pout, O_CLOEXEC);
+		r = pipe2(pout, O_CLOEXEC | O_NONBLOCK);
 		if (r < 0) {
 			warn("fork_tmux: Couldn't open fout: %d", errno);
 			r = -errno;
 			goto err_pin;
 		}
+		r = fcntl(pout[0], F_SETFL, O_NONBLOCK);
+		if (r < 0) {
+			warn("fork_tmux: Can't set fout O_NONBLOCK: %d", errno);
+			r = -errno;
+			goto err_pin;
+		}
 	}
 	if (ferr) {
-		r = pipe2(perr, O_CLOEXEC);
+		r = pipe2(perr, O_CLOEXEC | O_NONBLOCK);
 		if (r < 0) {
 			warn("fork_tmux: Couldn't open ferr: %d", errno);
 			r = -errno;
 			goto err_pout;
 		}
+		r = fcntl(perr[0], F_SETFL, O_NONBLOCK);
+		if (r < 0) {
+			warn("fork_tmux: Can't set ferr O_NONBLOCK: %d", errno);
+			r = -errno;
+			goto err_pin;
+		}
 	}
 
-	wlogs(DEBUG, "Forking: ");
+	wlogs(DEBUG, "fork_tmux: Forking: ");
 	for (int i = 0; exc[i]; ++i) wlogm(DEBUG, "%s ", exc[i]);
 	wloge(DEBUG);
 
@@ -241,9 +273,18 @@ static int fork_tmux(struct wtc_tmux *tmux, const char *const *cmds,
 		r = -errno;
 		goto err_perr;
 	} else if (cpid == 0) { // Child
-		if ((fin  && dup2(pin[0],  STDIN_FILENO)  != STDIN_FILENO)  ||
-		    (fout && dup2(pout[1], STDOUT_FILENO) != STDOUT_FILENO) ||
-		    (ferr && dup2(perr[1], STDERR_FILENO) != STDERR_FILENO)) {
+		r = 0;
+
+		if (fin)
+			while ((r = dup2(pin[0],  STDIN_FILENO)) == -1 &&
+			       errno == EINTR) ;
+		if (fout && r != -1)
+			while ((r = dup2(pout[1], STDOUT_FILENO)) == -1 &&
+			       errno == EINTR) ;
+		if (ferr && r != -1)
+			while ((r = dup2(perr[1], STDERR_FILENO)) == -1 &&
+			       errno == EINTR) ;
+		if (r == -1)
 			crit("Could not change stdio file descriptors: %d", errno);
 			_exit(errno);
 		}
@@ -264,35 +305,56 @@ static int fork_tmux(struct wtc_tmux *tmux, const char *const *cmds,
 	if (ferr)
 		*ferr = perr[0];
 
-	if(fin && close(pin[0])) {
-		warn("Couldn't close fin: %d", errno);
-		r = -errno;
+	if(fin) {
+		while((s = close(pin[0])) == -1 && errno == EINTR) ;
+		if (s == -1) {
+			warn("fork_tmux: Couldn't close fin: %d", errno);
+			r = -errno;
+		}
 	}
-	if (fout && close(pout[1])) {
-		warn("Couldn't close fout: %d", errno);
-		r = r ? r : -errno;
+	if(fout) {
+		while((s = close(pout[1])) == -1 && errno == EINTR) ;
+		if (s == -1) {
+			warn("fork_tmux: Couldn't close fout: %d", errno);
+			r = r ? r : -errno;
+		}
 	}
-	if (ferr && close(perr[1]) && !r) {
-		warn("Couldn't close ferr: %d", errno);
-		r = r ? r : -errno;
+	if(ferr) {
+		while((s = close(perr[1])) == -1 && errno == EINTR) ;
+		if (s == -1) {
+			warn("fork_tmux: Couldn't close ferr: %d", errno);
+			r = r ? r : -errno;
+		}
 	}
 
 	return r;
 
 err_perr:
 	if (ferr) {
-		close(perr[0]);
-		close(perr[1]);
+		while((s = close(perr[0])) == -1 && errno == EINTR) ;
+		if (s == -1)
+			warn("fork_tmux: Couldn't close perr0: %d", errno);
+		while((s = close(perr[1])) == -1 && errno == EINTR) ;
+		if (s == -1)
+			warn("fork_tmux: Couldn't close perr1: %d", errno);
 	}
 err_pout:
 	if (fout) {
-		close(pout[0]);
-		close(pout[1]);
+		while((s = close(pout[0])) == -1 && errno == EINTR) ;
+		if (s == -1)
+			warn("fork_tmux: Couldn't close pout0: %d", errno);
+		while((s = close(pout[1])) == -1 && errno == EINTR) ;
+		if (s == -1)
+			warn("fork_tmux: Couldn't close pout1: %d", errno);
 	}
 err_pin:
 	if (fin) {
-		close(pin[0]);
-		close(pin[1]);
+		while((s = close(pin[0])) == -1 && errno == EINTR) ;
+		if (s == -1)
+			warn("fork_tmux: Couldn't close pin0: %d", errno);
+		while((s = close(pin[1])) == -1 && errno == EINTR) ;
+		if (s == -1)
+			warn("fork_tmux: Couldn't close pin1: %d", errno);
 	}
 err_exc:
 	for (int i = 0; i < len; ++i)
@@ -302,44 +364,69 @@ err_exc:
 }
 
 /*
- * Fully read the current contents of the fd into a newly allocated string.
+ * Read the available contents of the fd into a newly allocated buffer.
  * Returns 0 on success, otherwise returns a negative error code. Can
  * return -ENOMEM if there are problems allocating the string and any of the
- * error codes from a call to read().
+ * error codes from a call to read(). On success the new buffer will be in
+ * *out and its size will be in *size. Note that the buffer will always have
+ * a \0 appended to it to ensure the buffer is a valid c string, although
+ * no guarantee is made that \0 won't be in the buffer earlier hence the
+ * size output. If this functions returns an error code, *size and *out
+ * will be unchanged. If size is NULL, the parameter will be discarded.
+ * If out is NULL -EINVAL will be returned.
  */
-static int read_full(int fd, char **out)
+static int read_available(int fd, int *size, char **out)
 {
+	if (!out)
+		return -EINVAL;
+
 	int r = 0;
 	char *buf = calloc(257, sizeof(char));
 	char *tmp = NULL;
 	int pos = 0;
 	int len = 256;
 	if (!buf) {
-		crit("read_full: Couldn't create buf!");
+		crit("read_available: Couldn't create buf!");
 		return -ENOMEM;
 	}
-	while ((r = read(fd, buf + pos, len - pos)) == len - pos) {
+	while (true) {
+		r = read(fd, buf + pos, len - pos);
+		if (r == -1) {
+			switch (errno) {
+			case EINTR:
+				continue;
+			case EAGAIN:
+#if EAGAIN != EWOULDBLOCK
+			case EWOULDBLOCK:
+#endif
+				r = 0;
+				break;
+			default:
+				warn("read_available: read error: %d", errno);
+				r = -errno;
+				goto err_buf;
+			}
+		}
+
 		pos += r;
+		if (pos != len)
+			break;
+
 		len *= 2;
 		tmp = realloc(buf, len + 1);
 		if (!tmp) {
-			crit("read_full: Couldn't resize buf!");
+			crit("read_available: Couldn't resize buf!");
 			r = -ENOMEM;
 			goto err_buf;
 		}
 		buf = tmp;
 	}
 
-	if (r == -1) {
-		warn("read_full: read error: %d", errno);
-		r = -errno;
-		goto err_buf;
-	}
-
-	pos += r;
 	memset(buf + pos, '\0', len + 1 - pos);
 
 	*out = buf;
+	if (size)
+		*size = pos + 1;
 	return 0;
 
 err_buf:
@@ -364,7 +451,7 @@ err_buf:
  * on that stream and no errors were detected while processing it.
  *
  * TODO handle timeout
- * TODO use control session isntead of new process if possible.
+ * TODO use control session instead of new process if possible.
  */
 static int exec_tmux(struct wtc_tmux *tmux, const char *const *cmds,
                      char **out, char **err)
@@ -372,7 +459,7 @@ static int exec_tmux(struct wtc_tmux *tmux, const char *const *cmds,
 	pid_t pid = 0;
 	int fout, ferr;
 	int *pout, *perr;
-	int r = 0;
+	int r = 0, s = 0;
 
 	if (!tmux || !cmds)
 		return -EINVAL;
@@ -384,6 +471,7 @@ static int exec_tmux(struct wtc_tmux *tmux, const char *const *cmds,
 	if (!pid)
 		return r;
 
+	// TODO Waitpid deal with EINTR
 	int status = 0;
 	if (waitpid(pid, &status, 0) != pid || r) {
 		if (!r)
@@ -401,24 +489,116 @@ static int exec_tmux(struct wtc_tmux *tmux, const char *const *cmds,
 		warn("exec_tmux: Child exit status: %d", status);
 
 	if (out) {
-		r = read_full(fout, out);
+		r = read_available(fout, NULL, out);
 		if (r)
 			goto err_fds;
 	}
 
 	if (err)
-		r = read_full(ferr, err);
+		r = read_available(ferr, NULL, err);
 
 err_fds:
-	if (out && close(fout)) {
-		warn("exec_tmux: Error closing fout: %d", fout);
-		r = r ? r : -errno;
+	if (out) {
+		while ((s = close(fout)) == -1 && errno = EINTR) ;
+		if (s == -1) {
+			warn("exec_tmux: Error closing fout: %d", errno);
+			r = r ? r : -errno;
+		}
 	}
-	if (err && close(ferr) && !r) {
-		warn("exec_tmux: Error closing fout: %d", fout);
-		r = r ? r : -errno;
+	if (err) {
+		while ((s = close(ferr)) == -1 && errno = EINTR) ;
+		if (s == -1) {
+			warn("exec_tmux: Error closing ferr: %d", errno);
+			r = r ? r : -errno;
+		}
 	}
 	return r ? r : status;
+}
+
+static int cc_cb(int fd, uint32_t mask, void *userdata)
+{
+	struct wtc_tmux_cc *cc = userdata;
+	debug("CB: %d", fd);
+	if (mask & WL_EVENT_READABLE) {
+		debug("Readable : %d", fd);
+		char *content = NULL;
+		int r = read_available(fd, NULL, &content);
+		if (content)
+			debug("Read (%d): %s", r, content);
+		else
+			warn("Read error: %d", r);
+		free(content);
+	}
+	if (mask & WL_EVENT_WRITABLE)
+		debug("Writeable: %d", fd);
+	if (mask & WL_EVENT_HANGUP)
+		debug("Hang Up: %d", fd);
+	if (mask & WL_EVENT_ERROR)
+		debug("Error: %d", fd);
+}
+
+/*
+ * Launch a control client on the specified session.
+ */
+static int launch_cc(struct wtc_tmux *tmux, struct wtc_tmux_session *sess)
+{
+	const char *cmd[] = { "-C", "attach-session", "-t", NULL, NULL };
+	char *dyn = NULL;
+	struct wlc_event_source *sin, *sout;
+	struct wtc_tmux_cc *cc, *tmp;
+	int fin, fout;
+	pid_t pid = 0;
+	int r;
+
+	if (!tmux || !sess) // TODO Launch new session here if sess is NULL?
+		return -EINVAL;
+
+	r = bprintf(&dyn, "$%u", sess->id);
+	if (r < 0)
+		return r;
+	cmd[3] = dyn;
+
+	cc = calloc(1, sizeof(struct wtc_tmux_cc));
+	if (!cc) {
+		crit("launch_cc: Couldn't allocate cc!");
+		r = -ENOMEM;
+		goto err_cmd;
+	}
+
+	r = fork_tmux(tmux, cmd, &pid, &fin, &fout, NULL);
+	if (!pid)
+		goto err_cc;
+
+	cc->tmux = tmux;
+	cc->session = sess;
+
+	cc->pid = pid;
+	cc->temp = false;
+	cc->fin = fin;
+	cc->fout = fout;
+
+	sin = wlc_event_loop_add_fd(fin, WL_EVENT_HANGUP, cc_cb, cc);
+	sout = wlc_event_loop_add_fd(fout, WL_EVENT_READABLE | WL_EVENT_HANGUP,
+	                             cc_cb, cc);
+
+	cc->ins = sin;
+	cc->outs = sout;
+
+	if (tmux->ccs) {
+		for (tmp = tmux->ccs; tmp->next; tmp = tmp->next) ;
+		tmp->next = cc;
+		cc->previous = tmp;
+	} else {
+		tmux->ccs = cc;
+	}
+
+	cc = NULL;
+
+err_cc:
+	free(cc);
+err_cmd:
+	free(dyn);
+	return r;
 }
 
 /*
@@ -1836,6 +2016,11 @@ int wtc_tmux_connect(struct wtc_tmux *tmux)
 	}
 
 	r = reload_sessions(tmux);
+	if (r < 0)
+		return r;
+
+	if (tmux->sessions)
+		r = launch_cc(tmux, tmux->sessions);
 	return r;
 }
 
