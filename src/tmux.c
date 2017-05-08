@@ -27,6 +27,7 @@
 
 #include "tmux.h"
 #include "log.h"
+#include "shl_ring.h"
 
 #include <assert.h>
 #include <errno.h>
@@ -75,7 +76,7 @@ struct wtc_tmux_cc {
 	bool temp;
 	int fin;
 	struct wlc_event_source *outs;
-	char *buf;
+	struct shl_ring buf;
 
 	struct wtc_tmux_cc *previous;
 	struct wtc_tmux_cc *next;
@@ -380,66 +381,174 @@ static inline unsigned int npo2(unsigned int base) {
 }
 
 /*
- * Read the available contents of the fd into a newly allocated buffer or
- * at the end of an existing buffer.
+ *   int read_available(int fd, int mode, int *size, void *out)
  *
- * read_available has three basic modes: if out is NULL, then this function
- * runs in "discard" mode---it simply reads everything available in the fd
- * and discards it. This can be useful for clearing a buffer. If out is not
- * NULL but size is NULL, then this function runs in "c string" mode---the
- * data read into the buffer has '\0' bytes replaced with 0x01 and the a
- * '\0' character appended to the end making the data read a vaild c string.
- * Finally, if out is not NULL and size is not NULL, this function runs in
- * "standard" mode---the data read is put into the buffer unmodified and the
- * total length of the data read is stored in *out.
+ * read_available in effect does exactly what it sounds like: it reads the
+ * available contents of a file descriptor. However, the specifics of this
+ * can be tweaked in several ways.
  *
- * In addition, in "c string" and "standard" mode, read_available can either
- * read the data into an empty buffer or append it to an existing buffer.
- * If *out is NULL, then the data will be read into an empty buffer.
- * However, if *out is not NULL then the data will be appended to the end of
- * the current contents of *out. In "c string" mode, the end of the current
- * contents will be detected by iterating through *out until '\0' is found.
- * The new data will start at the position of the '\0', replacing it. In
- * "standard" mode, the new data will start at the index specified by *size.
- * Note that when new data is being appended, the existing buffer is first
- * copied. Then, if the new read succeeds, the existing buffer is freed and
- * the pointer to it is set to the new buffer.
+ * The mode parameter is a bitwise or of up to one flag from the following
+ * two lists:
  *
- * Returns 0 on success, otherwise returns a negative error code. Can
- * return -ENOMEM if there are problems allocating the string and any of the
- * error codes from a call to read(). If the function is in "standard" mode,
- * *out is not NULL, and the value of *size is negative, -EINVAL will be
- * returned. If this function returns non zero, the values of *size and *out
- * will not be changed.
+ *   WTC_TMUX_READ_DISCARD, WTC_TMUX_READ_CSTRING, WTC_TMUX_READ_STANDARD
+ *
+ *   WTC_TMUX_READ_BUF, WTC_TMUX_READ_RING
+ *
+ * If no flag from the first list is included, WTC_TMUX_READ_DISCARD will
+ * be chosen by default and, likewise, WTC_TMUX_READ_BUF will be chosen if
+ * no flag is included from the second list. Depending on which flags are
+ * provided, the interpretation of size and out changes.
+ *
+ * WTC_TMUX_READ_DISCARD:
+ *   The contents of the file descriptor are read and immediately discarded.
+ *   This an be useful for clearing out a buffer. If size is not NULL, the
+ *   total amount of bytes read will be stored in *size. If this flag is set
+ *   all other flags are ignored (in particular, the value of out is ignored
+ *   and left unchanged).
+ *
+ * WTC_TMUX_READ_CSTRING:
+ *   The contents of the file descriptor are read into the appropriate
+ *   structure (see WTC_TMUX_READ_BUF and WTC_TMUX_READ_RING) followed by
+ *   a '\0' terminator. If '\0' occurs within the content read, it will
+ *   be replace with 0x01 such that for each call of read_available, exactly
+ *   one '\0' will be output, and it is guaranteed to be the last character
+ *   output. If size is not NULL and WTC_TMUX_READ_BUF is set, the total
+ *   amount of bytes read (that is, the '\0' terminator is not included) 
+ *   will be stored in *size. If size is not NULL and WTC_TMUX_READ_RING is
+ *   set, then the total amount of bytes written to the ring will be stored
+ *   in *size (that is, the '\0' terminator IS included).
+ *
+ * WTC_TMUX_READ_STANDARD:
+ *   The contents of the file descriptor are read into the appropriate
+ *   structure (see WTC_TMUX_READ_BUF and WTC_TMUX_READ_RING). The data read
+ *   will be unprocessed. If size is not NULL, the total amount of bytes
+ *   read will be stored in *size.
+ *
+ * WTC_TMUX_READ_BUF:
+ *   The contents read from the file descriptor are be to stored in a newly
+ *   allocated buffer of type char *. out will be interpreted as type
+ *   (char **). After a successful read, the new data will be stored in
+ *   *out. If *out is not NULL, the contents of *out will be copied to the
+ *   start of the newly allocated buffer and any read data will be appended
+ *   to them. Upon a successful read, the current contents of *out will be
+ *   freed and *out will be set to point to the new buffer. If
+ *   WTC_TMUX_READ_CSTRING is set, the size of *out will be determined via
+ *   strlen (thus, the '\0' terminator will not be copied over and the
+ *   buffer at *out upon a successful call will contain exactly one '\0').
+ *   If WTC_TMUX_READ_STANDARD is set, the size of *out will be determined
+ *   via the value stored in *size.
+ *
+ * WTC_TMUX_READ_RING:
+ *   The contents read from the file descriptor are to be stored in an
+ *   existing shl_ring (see shl_ring.h). out will be interpeted as type
+ *   (struct shl_ring *) and the data read will be appended via
+ *   shl_ring_push. Note that unlike with WTC_TMUX_READ_BUF, data is always
+ *   appended to an existing structure and, furthermore, no existing data
+ *   is removed. In particular, this means that multiple calls to
+ *   read_available with WTC_TMUX_READ_CSTRING set will result in multiple
+ *   '\0' characters being added to the ring (one after the contents read
+ *   by each invocation). This is in direct contrast with WTC_TMUX_READ_BUF
+ *   where multiple calls with WTC_TMUX_READ_CSTRING set will result in a
+ *   single '\0' character at the end of the total amount read. To emulate
+ *   this behavior with WTC_TMUX_READ_RING set, simply decrement
+ *   shl_ring->end before calling read_available a second time to "unset"
+ *   the '\0' terminator. Be careful, though, that if shl_ring->end == 0,
+ *   then shl_ring->end needs to be set to  (shl_ring->size - 1) not -1.
+ *
+ * read_available returns 0 on success, and a negative error code on
+ * failure. The errors that can occur are:
+ *
+ * -ENOMEM:
+ *   An issue occurred allocating memory for the read buffer or, if
+ *   WTC_TMUX_READ_RING is set, increasing the size of the ring buffer.
+ *
+ * -EINVAL:
+ *   One of the following situations occured: WTC_TMUX_READ_CSTRING and
+ *   WTC_TMUX_READ_STANDARD were set, out was NULL and WTC_TMUX_READ_DISCARD
+ *   was not set, or *out was not NULL, WTC_TMUX_READ_BUF was set and either
+ *   size was NULL or *size was negative.
+ *
+ * In addition, if a read call fails, then the following behavior occurs:
+ * if the error is EINTR, the error is ignored and the read is tried again;
+ * if the error is EAGAIN or EWOULDBLOCK, the error is ignored and the read
+ * is considered finished; otherwise, the read is aborted and -errno is
+ * returned.
+ *
+ * NOTE: If the read fails and either WTC_TMUX_READ_DISCARD or 
+ *       WTC_TMUX_READ_BUF is set, then size and out are unchanged
+ *       (although the file descriptor state will most likely be different
+ *       as content may have been read before the error). However, if
+ *       instead WTC_TMUX_READ_RING is set, then content is added to the 
+ *       ring immediately after being read. If some content is written to 
+ *       the ring and the function fails, then size will be updated to 
+ *       reflect the amount of data added to the ring. Furthermore, if
+ *       WTC_TMUX_READ_CSTRING is set, the null terminator will still be
+ *       added. However, if the error occurs while adding data to the ring,
+ *       size will not be updated. Note that the only error that can occur
+ *       when adding to the ring is ENOMEM in which case there isn't really
+ *       much hope of recovering, anyway.
  */
-static int read_available(int fd, int *size, char **out)
+#define WTC_TMUX_READ_DISCARD  (0 << 0)
+#define WTC_TMUX_READ_CSTRING  (1 << 0)
+#define WTC_TMUX_READ_STANDARD (2 << 0)
+
+#define WTC_TMUX_READ_BUF      (0 << 2)
+#define WTC_TMUX_READ_RING     (1 << 2)
+static int read_available(int fd, int mode, int *size, void *out)
 {
-	int r = 0;
+	struct shl_ring *ring;
 	char *buf, *tmp;
-	int pos, len;
-	// 0 - discard; 1 - c string; 2 - standard
-	int mode = !out ? 0 : size ? 2 : 1;
-	if (mode == 1 && *out) {
-		pos = strlen(*out);
-	} else if (mode == 2 && *out) {
-		pos = *size;
-		if (pos < 0)
-			return -EINVAL;
-	} else {
+	int pos, len, rd;
+	bool disc;
+	int r;
+
+	if ((mode & WTC_TMUX_READ_CSTRING) && (mode & WTC_TMUX_READ_STANDARD))
+		return -EINVAL;
+
+	// WTC_TMUX_READ_DISCARD
+	disc = !(mode & (WTC_TMUX_READ_CSTRING | WTC_TMUX_READ_STANDARD));
+
+	if (disc) {
+		len = 128;
 		pos = 0;
+	} else {
+		if (!out)
+			return -EINVAL;
+
+		if (mode & WTC_TMUX_READ_RING) {
+			ring = out;
+			len = 128;
+			pos = 0;
+		} else { // WTC_TMUX_READ_BUF
+			tmp = *((char **) out);
+			if (tmp && (mode & WTC_TMUX_READ_CSTRING)) {
+				pos = strlen(tmp);
+			} else if (tmp && (mode & WTC_TMUX_READ_BUF)) {
+				if (!size || *size < 0)
+					return -EINVAL;
+				pos = *size;
+			} else { // !tmp
+				pos = 0;
+			}
+
+			len = npo2(pos);
+			len = len < 128 ? 128 : pos;
+		}
 	}
-	len = npo2(pos);
-	len = len < 128 ? 128 : len;
+
+	// The + 1 ensures we'll always have space for a '\0' terminator
 	buf = calloc(len + 1, sizeof(char));
 	if (!buf) {
 		crit("read_available: Couldn't create buf!");
 		return -ENOMEM;
 	}
 	if (pos)
-		memcpy(buf, *out, pos);
+		memcpy(buf, tmp, pos);
 
+	rd = 0;
 	while (true) {
 		r = read(fd, buf + pos, len - pos);
+
 		if (r == -1) {
 			switch (errno) {
 			case EINTR:
@@ -457,19 +566,31 @@ static int read_available(int fd, int *size, char **out)
 			}
 		}
 
+		rd += r;
 		pos += r;
-		if (pos != len)
+		if (r != len)
 			break;
 
-		if (mode == 0) {
+		if (disc) {
 			pos = 0;
 			continue;
-		} else if (mode == 1) {
+		}
+
+		if (mode & WTC_TMUX_READ_CSTRING)
 			for (int i = pos - r; i < pos; ++i)
 				if (buf[i] == '\0')
 					buf[i] = 1;
+
+		if (mode & WTC_TMUX_READ_RING) {
+			r = shl_ring_push(ring, buf, r);
+			if (r < 0)
+				goto err_buf;
+
+			pos = 0;
+			continue;
 		}
 
+		// WTC_TMUX_READ_BUF
 		len *= 2;
 		tmp = realloc(buf, len + 1);
 		if (!tmp) {
@@ -480,23 +601,40 @@ static int read_available(int fd, int *size, char **out)
 		buf = tmp;
 	}
 
-	memset(buf + pos, '\0', len + 1 - pos);
+	r = 0;
 
-	if (out) {
-		*out = buf;
+	// WTC_TMUX_READ_BUF
+	if (!disc && !(mode & WTC_TMUX_READ_RING)) {
+		buf[pos] = '\0'; // The len + 1's earlier ensure this is in bounds
+
 		if (size)
-			*size = pos + 1;
+			*size = rd;
+		free(*((char **) out));
+		*((char **) out) = buf;
+		return 0;
 	}
-	return 0;
+
+	if (disc && size)
+		*size = rd;
 
 err_buf:
+	if (!disc && (mode & WTC_TMUX_READ_RING) && r != -ENOMEM) {
+		int s = 0;
+		if (mode & WTC_TMUX_READ_CSTRING)
+			s = shl_ring_push(ring, "\0", 1);
+
+		if (s)
+			r = s;
+		else if (size)
+			*size = rd + 1;
+	}
 	free(buf);
 	return r;
 }
 
 /*
- * Run the command specified in cmds, wait for it to finish, and store its 
- * stdout in out and stderr in err. Out and err may be NULL to indicate the 
+ * Run the command specified in cmds, wait for it to finish, and store its
+ * stdout in out and stderr in err. Out and err may be NULL to indicate the
  * respective streams should be ignored. Out and err will be populated by
  * read_avilable in "c string" mode. If *out or *err is not NULL, then they
  * are expected to point to an existing c string. On success the newly read
@@ -597,7 +735,7 @@ static void wtc_tmux_cc_unref(struct wtc_tmux_cc *cc)
 	if (cc->fin != -1 && close(cc->fin))
 			warn("wtc_tmux_cc_unref: Error when closing fin: %d", errno);
 
-	free(cc->buf);
+	free(cc->buf.buf);
 	free(cc);
 }
 
@@ -607,13 +745,11 @@ static int cc_cb(int fd, uint32_t mask, void *userdata)
 	debug("CB: %d", fd);
 	if (mask & WL_EVENT_READABLE) {
 		debug("Readable : %d", fd);
-		char *content = NULL;
-		int r = read_available(fd, NULL, &content);
-		if (content)
-			debug("Read (%d): %s", r, content);
+		int r = read_available(fd, NULL, &cc->buf);
+		if (cc->buf)
+			debug("Read (%d): %s", r, cc->buf);
 		else
 			warn("Read error: %d", r);
-		free(content);
 	}
 	if (mask & (WL_EVENT_HANGUP | WL_EVENT_ERROR)) {
 		if (mask & WL_EVENT_HANGUP)
@@ -721,7 +857,7 @@ static int launch_cc(struct wtc_tmux *tmux, struct wtc_tmux_session *sess)
 	cc->temp = false;
 	cc->fin = fin;
 
-	cc->outs = wlc_event_loop_add_fd(fout, WL_EVENT_READABLE 
+	cc->outs = wlc_event_loop_add_fd(fout, WL_EVENT_READABLE
 	                                     | WL_EVENT_HANGUP, cc_cb, cc);
 	if (!cc->outs) {
 		warn("launch_cc: Couldn't add fout to event loop!");
@@ -761,16 +897,17 @@ err_cmd:
  * Retrieve the value of the option specified by name. The trailing newline
  * will be omitted in *out. Mode can be a bitwise or of several of the
  * gollowing flags. If the global or server flags are set, then target is
- * ignored. If the session flag is set, then target will be used to 
+ * ignored. If the session flag is set, then target will be used to
  * determine which session to query and likewise for the window flag.
  *
  * Note that out must be non-NULL and *out must be NULL.
  */
-#define WTC_TMUX_OPTION_LOCAL   0
-#define WTC_TMUX_OPTION_GLOBAL  1<<0
-#define WTC_TMUX_OPTION_WINDOW  0
-#define WTC_TMUX_OPTION_SESSION 1<<1
-#define WTC_TMUX_OPTION_SERVER  1<<2
+#define WTC_TMUX_OPTION_LOCAL   (0 << 0)
+#define WTC_TMUX_OPTION_GLOBAL  (1 << 0)
+
+#define WTC_TMUX_OPTION_WINDOW  (0 << 1)
+#define WTC_TMUX_OPTION_SESSION (1 << 1)
+#define WTC_TMUX_OPTION_SERVER  (2 << 1)
 static int get_option(struct wtc_tmux *tmux, const char *name,
                       int target, int mode, char **out)
 {
@@ -1128,7 +1265,7 @@ static int parselniii(const char *fmt, char *str, int *olen,
 	char *pos = strtok_r(str, "\n", &svptr);
 	int linec = 0;
 	while (pos != NULL) {
-		r = sscanf(pos, fmt, &is[count], &is2[count], 
+		r = sscanf(pos, fmt, &is[count], &is2[count],
 		           &is3[count], &linec);
 		if (r != 3 || linec != strlen(pos)) {
 			warn("parselniii: Parse error!");
@@ -1348,7 +1485,7 @@ err_out:
  * delim and saveptr must not be NULL. fdelim may be NULL (in which case
  * the changed token will not be stored)
  */
-static char *strtokd(char *str, const char *delim, 
+static char *strtokd(char *str, const char *delim,
                      char **saveptr, char *fdelim)
 {
 	char *startptr = str ? str : *saveptr;
@@ -1390,7 +1527,7 @@ out:
 }
 
 /*
- * Basic positive integer parsing function, in the vain of atoi. If the 
+ * Basic positive integer parsing function, in the vain of atoi. If the
  * string contains a character other than 0-9, returns -1. If the string
  * is empty, returns -1. If the string will overflow an int, returns -1.
  */
@@ -1419,7 +1556,7 @@ static int parseint(const char *str)
  * changed, make a copy before calling.
  *
  * Returns 0 on success and -EINVAL on a parse error. If the callback
- * returns non-zero, parsing will be aborted this function will return 
+ * returns non-zero, parsing will be aborted this function will return
  * the callback's return value.
  */
 static int process_layout(char *layout, void *userdata,
@@ -1530,7 +1667,7 @@ static int reload_panes(struct wtc_tmux *tmux)
 {
 	int r = 0;
 	// First, establish the list of panes.
-	const char *cmd[] = { "list-panes", "-aF", 
+	const char *cmd[] = { "list-panes", "-aF",
 	                      "#{pane_id} #{window_id} #{pane_active}",
 	                      NULL };
 	char *out = NULL;
@@ -1702,7 +1839,7 @@ static int reload_windows(struct wtc_tmux *tmux)
 {
 	int r = 0;
 	// First, establish the list of windows.
-	const char *cmd[] = { "list-windows", "-aF", 
+	const char *cmd[] = { "list-windows", "-aF",
 	                      "#{window_id} #{session_id} #{window_active}",
 	                      NULL };
 	char *out = NULL;
@@ -1753,7 +1890,7 @@ static int reload_windows(struct wtc_tmux *tmux)
 
 		wind = calloc(1, sizeof(struct wtc_tmux_window));
 		if (!wind) {
-			crit("reload_windows: Couldn't allocate window!"); 
+			crit("reload_windows: Couldn't allocate window!");
 			r = -ENOMEM;
 			goto err_wids;
 		}
@@ -1784,7 +1921,7 @@ static int reload_windows(struct wtc_tmux *tmux)
 			sess->window_count = 0;
 			windows = calloc(4, sizeof(*windows));
 			if (!windows) {
-				crit("reload_windows: Couldn't allocate windows list!"); 
+				crit("reload_windows: Couldn't allocate windows list!");
 				r = -ENOMEM;
 				goto err_wids;
 			}
@@ -1793,7 +1930,7 @@ static int reload_windows(struct wtc_tmux *tmux)
 
 		HASH_FIND_INT(tmux->windows, &wids[i], wind);
 		if (!wind) {
-			warn("reload_windows: Couldn't find window %d!", wids[i]); 
+			warn("reload_windows: Couldn't find window %d!", wids[i]);
 			r = -EINVAL;
 			goto err_windows;
 		}
@@ -1845,7 +1982,7 @@ static int reload_clients(struct wtc_tmux *tmux)
 {
 	int r = 0;
 	// First, establish the list of clients.
-	const char *cmd[] = { "list-clients", "-F", 
+	const char *cmd[] = { "list-clients", "-F",
 	                      "#{session_id} #{client_pid} |#{client_name}",
 	                      NULL };
 	char *out = NULL;
@@ -1900,7 +2037,7 @@ static int reload_clients(struct wtc_tmux *tmux)
 			r = -ENOMEM;
 			goto err_ids;
 		}
-		HASH_ADD_KEYPTR(hh, tmux->clients, client->name, 
+		HASH_ADD_KEYPTR(hh, tmux->clients, client->name,
 		                strlen(client->name), client);
 	}
 
