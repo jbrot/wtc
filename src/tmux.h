@@ -34,6 +34,10 @@
  * return value. 0 means the operation was successful whereas a negative
  * value indicates an error occurred. See individual functions for the
  * specific error codes.
+ *
+ * NOTE: The SIGCHLD handler gets replaced with an internal handler once 
+ * wtc_tmux_connect succeeds. The original handler gets restored once 
+ * wtc_tmux_disconnect gets called.
  */
 
 #ifndef WTC_TMUX_H
@@ -209,10 +213,8 @@ struct wtc_tmux_client
 int wtc_tmux_new(struct wtc_tmux **out);
 /*
  * Adjust the reference count. If the reference count falls to zero, the
- * object will be freed and the underlying processes shut down. The
- * underlying process will be shut down synchronously. If the tmux does not
- * terminate within the timeout period, it will killed via SIGKILL (see
- * wtc_tmux_set_timeout).
+ * object will be freed. If the tmux object is connected when its reference
+ * count falls to 0, wtc_tmux_disconnect will be called first.
  */
 void wtc_tmux_ref(struct wtc_tmux *tmux);
 void wtc_tmux_unref(struct wtc_tmux *tmux);
@@ -297,6 +299,9 @@ const char *wtc_tmux_get_config_file(const struct wtc_tmux *tmux);
  * the event that the "wtc_tmux" session is open and no one else is
  * connected to it, the "wtc_tmux" session will be terminated before
  * disconnection.
+ *
+ * NOTE: The SIGCHLD hanlder gets replaced once wtc_tmux_connect succeeds.
+ * The original handler gets restored after calling wtc_tmux_disconnect.
  */
 int wtc_tmux_connect(struct wtc_tmux *tmux);
 int wtc_tmux_disconnect(struct wtc_tmux *tmux);

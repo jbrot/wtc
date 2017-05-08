@@ -31,6 +31,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -75,7 +76,6 @@ struct wtc_tmux_cc {
 	int fin;
 	struct wlc_event_source *outs;
 
-
 	struct wtc_tmux_cc *previous;
 	struct wtc_tmux_cc *next;
 };
@@ -88,6 +88,8 @@ struct wtc_tmux {
 	struct wtc_tmux_session *sessions;
 	struct wtc_tmux_client *clients;
 
+	struct sigaction restore;
+	struct wlc_event_source *sigc;
 	struct wtc_tmux_cc *ccs;
 
 	char *bin;
@@ -235,31 +237,43 @@ static int fork_tmux(struct wtc_tmux *tmux, const char *const *cmds,
 		}
 	}
 	if (fout) {
-		r = pipe2(pout, O_CLOEXEC | O_NONBLOCK);
+		r = pipe2(pout, O_CLOEXEC);
 		if (r < 0) {
 			warn("fork_tmux: Couldn't open fout: %d", errno);
 			r = -errno;
 			goto err_pin;
 		}
-		r = fcntl(pout[0], F_SETFL, O_NONBLOCK);
+		r = fcntl(pout[0], F_GETFL);
+		if (r < 0) {
+			warn("fork_tmux: Can't get fout flags: %d", errno);
+			r = -errno;
+			goto err_pout;
+		}
+		r = fcntl(pout[0], F_SETFL, r | O_NONBLOCK);
 		if (r < 0) {
 			warn("fork_tmux: Can't set fout O_NONBLOCK: %d", errno);
 			r = -errno;
-			goto err_pin;
+			goto err_pout;
 		}
 	}
 	if (ferr) {
-		r = pipe2(perr, O_CLOEXEC | O_NONBLOCK);
+		r = pipe2(perr, O_CLOEXEC);
 		if (r < 0) {
 			warn("fork_tmux: Couldn't open ferr: %d", errno);
 			r = -errno;
 			goto err_pout;
 		}
-		r = fcntl(perr[0], F_SETFL, O_NONBLOCK);
+		r = fcntl(perr[0], F_GETFL);
+		if (r < 0) {
+			warn("fork_tmux: Can't get ferr flags: %d", errno);
+			r = -errno;
+			goto err_perr;
+		}
+		r = fcntl(perr[0], F_SETFL, r | O_NONBLOCK);
 		if (r < 0) {
 			warn("fork_tmux: Can't set ferr O_NONBLOCK: %d", errno);
 			r = -errno;
-			goto err_pin;
+			goto err_perr;
 		}
 	}
 
@@ -550,6 +564,12 @@ static int cc_cb(int fd, uint32_t mask, void *userdata)
 	return 0;
 }
 
+static int sigc_cb(int fd, uint32_t mask, void *userdata)
+{
+	// TODO
+	return 0;
+}
+
 /*
  * Launch a control client on the specified session.
  */
@@ -723,6 +743,9 @@ void wtc_tmux_unref(struct wtc_tmux *tmux)
 {
 	if (!tmux || !tmux->ref || tmux->ref--)
 		return;
+
+	if (tmux->connected)
+		wtc_tmux_disconnect(tmux);
 
 	struct wtc_tmux_pane *pane, *tmpp;
 	HASH_ITER(hh, tmux->panes, pane, tmpp) {
@@ -2015,41 +2038,120 @@ err_cmd:
 	return r;
 }
 
+int sigcpipe[2];
+
+static void sigchld_handler(int signal)
+{
+	int save_errno = errno;
+	write(sigcpipe[1], "", 1);
+	errno = save_errno;
+}
+
 int wtc_tmux_connect(struct wtc_tmux *tmux)
 {
+	struct sigaction act;
 	int r = 0;
 
-	if (!tmux || tmux->connected)
+	if (!tmux)
 		return -EINVAL;
+	if (tmux->connected)
+		return 0;
+
+	r = pipe2(sigcpipe, O_CLOEXEC);
+	if (r < 0) {
+		crit("wtc_tmux_connect: Couldn't open sigcpipe: %d", errno);
+		return -errno;
+	}
+	for (int i = 0; i < 2; ++i) {
+		r = fcntl(sigcpipe[i], F_GETFL);
+		if (r < 0) {
+			crit("wtc_tmux_connect: Can't get sigcpipe[%d] flags: %d",
+			     i, errno);
+			r = -errno;
+			goto err_pipe;
+		}
+		r = fcntl(sigcpipe[i], F_SETFL, r | O_NONBLOCK);
+		if (r < 0) {
+			crit("wtc_tmux_connect: Can't set sigcpipe[i] O_NONBLOCK: %d",
+			     i, errno);
+			r = -errno;
+			goto err_pipe;
+		}
+	}
+
+	tmux->sigc = wlc_event_loop_add_fd(sigcpipe[0], WL_EVENT_READABLE |
+	                                   WL_EVENT_HANGUP, sigc_cb, tmux);
+	if (!tmux->sigc) {
+		crit("wtc_tmux_connect: Could not register SIGCHLD callback!");
+		r = -1;
+		goto err_pipe;
+	}
+
+	memset(&act, 0, sizeof(struct sigaction));
+	act.sa_handler = sigchld_handler;
+	act.sa_flags = SA_NOCLDSTOP;
+	r = sigaction(SIGCHLD, &act, &tmux->restore);
+	if (r < 0) {
+		crit("wtc_tmux_connect: Could not set SIGCHLD handler: %d", errno);
+		r = -errno;
+		goto err_evl;
+	}
 
 	r = update_cmd(tmux);
 	if (r < 0)
-		return r;
+		goto err_sig;
 
 	r = version_check(tmux);
 	switch (r) {
 	case 0:
 		crit("Invalid tmux version! tmux must either be version 'master' "
 		     "or newer than version '2.4'");
-		return -1;
+		r = -1;
+		goto err_sig;
 	case 1:
 		r = 0;
 		break;
 	default:
-		return r;
+		goto err_sig;
 	}
 
 	r = reload_sessions(tmux);
 	if (r < 0)
-		return r;
+		goto err_sig;
 
 	if (tmux->sessions)
 		r = launch_cc(tmux, tmux->sessions);
+	return r;
+
+err_sig:
+	sigaction(SIGCHLD, &tmux->restore, NULL);
+	memset(&tmux->restore, 0, sizeof(struct sigaction));
+err_evl:
+	wlc_event_source_remove(tmux->sigc);
+	tmux->sigc = NULL;
+	if (0) {
+err_pipe:
+		if (close(sigcpipe[0]))
+			warn("wtc_tmux_connect: Error closing sigcpipe[0]: %d", errno);
+	}
+	if (close(sigcpipe[1]))
+		warn("wtc_tmux_connect: Error closing sigcpipe[1]: %d", errno);
 	return r;
 }
 
 int wtc_tmux_disconnect(struct wtc_tmux *tmux)
 {
+	if (!tmux)
+		return -EINVAL;
+	if (!tmux->connected)
+		return 0;
+
+	sigaction(SIGCHLD, &tmux->restore, NULL);
+	memset(&tmux->restore, 0, sizeof(struct sigaction));
+	wlc_event_source_remove(tmux->sigc);
+	tmux->sigc = NULL;
+	if (close(sigcpipe[1]))
+		warn("wtc_tmux_disconnect: Error closing sigcpipe[1]: %d", errno);
 	// TODO
 }
 
