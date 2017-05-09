@@ -23,6 +23,11 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+/*
+ * This file contains some general purpose utility functions I wrote for
+ * wtc.
+ */
+
 #ifndef WTC_RDAVL_H
 #define WTC_RDAVL_H
 
@@ -141,5 +146,61 @@
 #define WTC_RDAVL_BUF      (0 << 2)
 #define WTC_RDAVL_RING     (1 << 2)
 int read_available(int fd, int mode, int *size, void *out);
+
+/*
+ * Dynamically allocate memory for the specified printf operation and
+ * then store the result in it. Returns 0 on success and negative error
+ * value. out must be non-NULL while *out must be NULL.
+ */
+__attribute__((format (printf, 2, 3)))
+int bprintf(char **out, const char *format, ...);
+
+/*
+ * The following functions all parse the input string str line by line
+ * per a format string fmt. What gets parsed in each line varies from
+ * function to function. The number of lines parsed is put into *olen
+ * while the contents of each line are put into *out (and friends).
+ * *out (and friends) will be dynamically allocated. Unless specified
+ * elsewhere, the fmt should always end with "%n" to allow full line
+ * parsing verification.
+ *
+ * Theses functions return 0 on success, -EIVAl if passed NULL inputs or if
+ * there is a parse error, and -ENOMEM if the output arrays can't be
+ * created. If there is a non-zero return, *olen and *out will not be
+ * modified. However, lines are parsed from str via strtok_r, which means
+ * that str will be modified during parsing. str will not be restored to
+ * its original state, so if it is important that str is unchanged, make
+ * a copy before calling one of these functions.
+ *
+ * Example parselni fmt: "$%u%n"
+ */
+int parselni(const char *fmt, char *str, int *olen, int **out);
+
+/*
+ * Parse three integers per line instead of one.
+ *
+ * Example parselniii format: "$%u @%u %u%n"
+ */
+int parselniii(const char *fmt, char *str, int *olen, int **out, 
+               int **out2, int **out3);
+
+/*
+ * Parse two integers and a string per line instead of one. Note that the
+ * format should parse everything up until the string and then the rest of
+ * the line will be parsed as the string.
+ *
+ * Example parselniis format: "$%u @%u %n"
+ */
+int parselniis(const char *fmt, char *str, int *olen, int **out,
+               int **out2, char ***out3);
+
+/*
+ * strtokd functions identically to strtok_r except that the character
+ * which is overwritten to makr the end of the token is stored in fdelim.
+ *
+ * delim and saveptr must not be NULL. fdelim may be NULL (in which case
+ * the changed token will not be stored)
+ */
+char *strtokd(char *str, const char *delim, char **saveptr, char *fdelim);
 
 #endif // !WTC_RDAVL_H
