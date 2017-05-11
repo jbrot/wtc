@@ -876,6 +876,25 @@ err_out:
 	return r;
 }
 
+static void print_status(struct wtc_tmux *tmux)
+{
+	const struct wtc_tmux_session *sess = wtc_tmux_root_session(tmux);
+	const struct wtc_tmux_window *wind;
+	const struct wtc_tmux_pane *pane;
+	const struct wtc_tmux_client *client;
+	for (; sess; sess = sess->hh.next) {
+		debug("$%u -- %u -- %u", sess->id, sess->statusbar, sess->window_count);
+		for (int i = 0; i < sess->window_count; ++i) {
+			wind = sess->windows[i];
+			debug("  @%u -- %u", wind->id, wind == sess->active_window);
+			for (pane = wind->panes; pane; pane = pane->next)
+				debug("    %%%u -- %u -- %ux%u,%u,%u", pane->id, pane == wind->active_pane, pane->w, pane->h, pane->x, pane->y);
+		}
+		for (client = sess->clients; client; client = client->next)
+			debug("  %s -- %u", client->name, client->pid);
+	}
+}
+
 int wtc_tmux_refresh_cb(int fd, uint32_t mask, void *userdata)
 {
 	struct wtc_tmux *tmux = userdata;
@@ -926,6 +945,8 @@ int wtc_tmux_refresh_cb(int fd, uint32_t mask, void *userdata)
 		if (r)
 			break;
 	}
+
+	print_status(tmux);
 
 exit:
 	wtc_tmux_clear_closures(tmux);
@@ -1100,7 +1121,6 @@ int wtc_tmux_cc_process_output(struct wtc_tmux_cc *cc)
 			if (r < 0)
 				return r;
 			break;
-		case TMUX_CC_SESSION_WINDOW_CHANGED:
 		case TMUX_CC_SESSIONS_CHANGED:
 			r = consume_line(cc);
 			if (r <= 0)
@@ -1109,6 +1129,7 @@ int wtc_tmux_cc_process_output(struct wtc_tmux_cc *cc)
 			if (r < 0)
 				return r;
 			break;
+		case TMUX_CC_SESSION_WINDOW_CHANGED:
 		case TMUX_CC_WINDOW_ADD:
 		case TMUX_CC_WINDOW_CLOSE:
 		case TMUX_CC_UNLINKED_WINDOW_ADD:

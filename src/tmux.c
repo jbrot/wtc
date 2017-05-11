@@ -507,18 +507,11 @@ int wtc_tmux_connect(struct wtc_tmux *tmux)
 		goto err_sig;
 	}
 
-	r = wtc_tmux_reload_sessions(tmux);
+	r = wtc_tmux_queue_refresh(tmux, WTC_TMUX_REFRESH_SESSIONS);
 	if (r < 0)
 		goto err_sig;
 
-	if (tmux->sessions) {
-		struct wtc_tmux_session *sess;
-		for (sess = tmux->sessions; sess; sess = sess->hh.next) {
-			r = wtc_tmux_cc_launch(tmux, sess);
-			if (r < 0)
-				fatal("Not sure what to do here yet.");
-		}
-	}
+	tmux->connected = true;
 	return r;
 
 err_sig:
@@ -763,6 +756,9 @@ int wtc_tmux_closure_invoke(struct wtc_tmux_cb_closure *cl)
 
 	case WTC_TMUX_CB_NEW_SESSION:
 		p = 2;
+		r = wtc_tmux_cc_launch(tmux, cl->value.session);
+		if (r < 0)
+			break;
 		if (tmux->cbs.new_session)
 			r = tmux->cbs.new_session(tmux, cl->value.session);
 		break;
