@@ -46,29 +46,58 @@ struct wtc_tmux_cc;
  * wtc_tmux definition simpler.
  */
 struct wtc_tmux_cbs {
-	void (*new_client)(struct wtc_tmux *tmux,
-	                   const struct wtc_tmux_client *client);
-	void (*client_session_changed)(struct wtc_tmux *tmux,
-	                               const struct wtc_tmux_client *client);
+	int (*client_session_changed)(struct wtc_tmux *tmux,
+	                              const struct wtc_tmux_client *client);
 
-	void (*new_session)(struct wtc_tmux *tmux,
-	                    const struct wtc_tmux_session *session);
-	void (*session_closed)(struct wtc_tmux *tmux,
-	                       const struct wtc_tmux_session *session);
-	void (*session_window_changed)(struct wtc_tmux *tmux,
-	                               const struct wtc_tmux_session *session);
+	int (*new_session)(struct wtc_tmux *tmux,
+	                   const struct wtc_tmux_session *session);
+	int (*session_closed)(struct wtc_tmux *tmux,
+	                      const struct wtc_tmux_session *session);
+	int (*session_window_changed)(struct wtc_tmux *tmux,
+	                              const struct wtc_tmux_session *session);
 
-	void (*new_window)(struct wtc_tmux *tmux,
-	                   const struct wtc_tmux_window *window);
-	void (*window_closed)(struct wtc_tmux *tmux,
-	                      const struct wtc_tmux_window *window);
-	void (*window_layout_changed)(struct wtc_tmux *tmux,
-	                              const struct wtc_tmux_window *window);
-	void (*window_pane_changed)(struct wtc_tmux *tmux,
-	                            const struct wtc_tmux_window *window);
+	int (*new_window)(struct wtc_tmux *tmux,
+	                  const struct wtc_tmux_window *window);
+	int (*window_closed)(struct wtc_tmux *tmux,
+	                     const struct wtc_tmux_window *window);
+	int (*window_pane_changed)(struct wtc_tmux *tmux,
+	                           const struct wtc_tmux_window *window);
 
-	void (*pane_mode_changed)(struct wtc_tmux *tmux,
-	                          const struct wtc_tmux_pane *pane);
+	int (*new_pane)(struct wtc_tmux *tmux,
+	                const struct wtc_tmux_pane *pane);
+	int (*pane_closed)(struct wtc_tmux *tmux,
+	                   const struct wtc_tmux_pane *pane);
+	int (*pane_resized)(struct wtc_tmux *tmux,
+	                    const struct wtc_tmux_pane *pane);
+	int (*pane_mode_changed)(struct wtc_tmux *tmux,
+	                         const struct wtc_tmux_pane *pane);
+};
+
+/*
+ * Contains all the necessary information to invoke a callback.
+ */
+struct wtc_tmux_cb_closure {
+	int fid;
+#define WTC_TMUX_CB_EMPTY                   0
+#define WTC_TMUX_CB_CLIENT_SESSION_CHANGED  1
+#define WTC_TMUX_CB_NEW_SESSION             2
+#define WTC_TMUX_CB_SESSION_CLOSED          3
+#define WTC_TMUX_CB_SESSION_WINDOW_CHANGED  4
+#define WTC_TMUX_CB_NEW_WINDOW              5
+#define WTC_TMUX_CB_WINDOW_CLOSED           6
+#define WTC_TMUX_CB_WINDOW_PANE_CHANGED     7
+#define WTC_TMUX_CB_NEW_PANE                8
+#define WTC_TMUX_CB_PANE_CLOSED             9
+#define WTC_TMUX_CB_PANE_RESIZED           10
+#define WTC_TMUX_CB_PANE_MODE_CHANGED      11
+	struct wtc_tmux *tmux;
+	union {
+		struct wtc_tmux_pane *pane;
+		struct wtc_tmux_window *window;
+		struct wtc_tmux_session *session;
+		struct wtc_tmux_client *client;
+	} value;
+	bool free_after_use;
 };
 
 /*
@@ -107,6 +136,10 @@ struct wtc_tmux {
 	unsigned int h;
 
 	struct wtc_tmux_cbs cbs;
+
+	struct wtc_tmux_cb_closure *closures;
+	size_t closure_size; /* Amount used by closures */
+	size_t closure_len; /* Amount allocated for closures */
 };
 
 /*
@@ -136,6 +169,23 @@ void wtc_tmux_pane_free(struct wtc_tmux_pane *pane);
 void wtc_tmux_window_free(struct wtc_tmux_window *window);
 void wtc_tmux_session_free(struct wtc_tmux_session *sess);
 void wtc_tmux_client_free(struct wtc_tmux_client *client);
+
+int wtc_tmux_add_closure(struct wtc_tmux *, struct wtc_tmux_cb_closure);
+/*
+ * Run the specified closure. Returns 0 on success and 1 on failure.
+ * On success, fid will be set to WTC_TMUX_CB_EMPTY. Furthermore, if
+ * free_after_use is set, the resource in value will be freed and
+ * free_after_use will be reset. Thus, calling this function a second time
+ * on the same closure will have no effect and, furthermore, it is safe
+ * to call wtc_tmux_clear_closures even if this function has been called
+ * on some of the closures already.
+ */
+int wtc_tmux_closure_invoke(struct wtc_tmux_cb_closure *closure);
+/*
+ * Clear all of the closures currently queued without executing. If a
+ * closure has free_after_use set, its resource will be freed.
+ */
+void wtc_tmux_clear_closures(struct wtc_tmux *tmux);
 
 /*
  * The following functions are implemented in tmux_process.c

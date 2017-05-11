@@ -244,6 +244,8 @@ static int reload_panes_cb(int pid, int x, int y, int w, int h, void *ud)
 {
 	struct wtc_tmux *tmux = ud;
 	struct wtc_tmux_pane *pane;
+	struct wtc_tmux_cb_closure cb;
+	bool unchanged;
 	HASH_FIND_INT(tmux->panes, &pid, pane);
 
 	if (!pane) {
@@ -251,12 +253,22 @@ static int reload_panes_cb(int pid, int x, int y, int w, int h, void *ud)
 		return -EINVAL;
 	}
 
+	unchanged = (pane->x == x) && (pane->y == y) && 
+	            (pane->w == w) && (pane->h == h);
+
+	if (unchanged)
+		return 0;
+
 	pane->x = x;
 	pane->y = y;
 	pane->w = w;
 	pane->h = h;
 
-	return 0;
+	cb.fid = WTC_TMUX_CB_PANE_RESIZED;
+	cb.tmux = tmux;
+	cb.value.pane = pane;
+	cb.free_after_use = false;
+	return wtc_tmux_add_closure(tmux, cb);
 }
 
 /*
@@ -271,7 +283,7 @@ static int reload_panes_cb(int pid, int x, int y, int w, int h, void *ud)
 int wtc_tmux_reload_panes(struct wtc_tmux *tmux)
 {
 	int r = 0;
-	// First, establish the list of panes.
+	struct wtc_tmux_cb_closure cb;
 	const char *cmd[] = { "list-panes", "-aF",
 	                      "#{pane_id} #{window_id} #{pane_active}",
 	                      NULL };
@@ -310,7 +322,14 @@ int wtc_tmux_reload_panes(struct wtc_tmux *tmux)
 			continue;
 
 		HASH_DEL(tmux->panes, pane);
-		wtc_tmux_pane_free(pane);
+
+		cb.fid = WTC_TMUX_CB_PANE_CLOSED;
+		cb.tmux = tmux;
+		cb.value.pane = pane;
+		cb.free_after_use = true;
+		r = wtc_tmux_add_closure(tmux, cb);
+		if (r < 0)
+			goto err_pids;
 	}
 
 	for (int i = 0; i < count; ++i) {
@@ -333,6 +352,14 @@ int wtc_tmux_reload_panes(struct wtc_tmux *tmux)
 		}
 		pane->id = pids[i];
 		HASH_ADD_INT(tmux->panes, id, pane);
+
+		cb.fid = WTC_TMUX_CB_NEW_PANE;
+		cb.tmux = tmux;
+		cb.value.pane = pane;
+		cb.free_after_use = false;
+		r = wtc_tmux_add_closure(tmux, cb);
+		if (r < 0)
+			goto err_pids;
 	}
 
 	// Now to update the linked lists. Although the same window may be
@@ -388,8 +415,17 @@ int wtc_tmux_reload_panes(struct wtc_tmux *tmux)
 		wind->pane_count++;
 		pane->window = wind;
 
-		if (active[i])
+		if (active[i] && wind->active_pane != pane) {
 			wind->active_pane = pane;
+
+			cb.fid = WTC_TMUX_CB_WINDOW_PANE_CHANGED;
+			cb.tmux = tmux;
+			cb.value.window = wind;
+			cb.free_after_use = false;
+			r = wtc_tmux_add_closure(tmux, cb);
+			if (r < 0)
+				goto err_pids;
+		}
 
 		if (prev) {
 			prev->next = pane;
@@ -433,7 +469,7 @@ err_out:
 int wtc_tmux_reload_windows(struct wtc_tmux *tmux)
 {
 	int r = 0;
-	// First, establish the list of windows.
+	struct wtc_tmux_cb_closure cb;
 	const char *cmd[] = { "list-windows", "-aF",
 	                      "#{window_id} #{session_id} #{window_active}",
 	                      NULL };
@@ -468,7 +504,14 @@ int wtc_tmux_reload_windows(struct wtc_tmux *tmux)
 			continue;
 
 		HASH_DEL(tmux->windows, wind);
-		wtc_tmux_window_free(wind);
+
+		cb.fid = WTC_TMUX_CB_WINDOW_CLOSED;
+		cb.tmux = tmux;
+		cb.value.window = wind;
+		cb.free_after_use = true;
+		r = wtc_tmux_add_closure(tmux, cb);
+		if (r < 0)
+			goto err_wids;
 	}
 
 	for (int i = 0; i < count; ++i) {
@@ -491,6 +534,14 @@ int wtc_tmux_reload_windows(struct wtc_tmux *tmux)
 		}
 		wind->id = wids[i];
 		HASH_ADD_INT(tmux->windows, id, wind);
+
+		cb.fid = WTC_TMUX_CB_NEW_WINDOW;
+		cb.tmux = tmux;
+		cb.value.window = wind;
+		cb.free_after_use = false;
+		r = wtc_tmux_add_closure(tmux, cb);
+		if (r < 0)
+			goto err_wids;
 	}
 
 	// Now to update the windows lists
@@ -534,8 +585,17 @@ int wtc_tmux_reload_windows(struct wtc_tmux *tmux)
 		}
 		windows[sess->window_count] = wind;
 		sess->window_count++;
-		if (active[i])
+		if (active[i] && sess->active_window != wind) {
 			sess->active_window = wind;
+
+			cb.fid = WTC_TMUX_CB_SESSION_WINDOW_CHANGED;
+			cb.tmux = tmux;
+			cb.value.session = sess;
+			cb.free_after_use = false;
+			r = wtc_tmux_add_closure(tmux, cb);
+			if (r < 0)
+				goto err_windows;
+		}
 
 		if (sess->window_count == wsize) {
 			wsize *= 2;
@@ -571,7 +631,7 @@ err_out:
 int wtc_tmux_reload_clients(struct wtc_tmux *tmux)
 {
 	int r = 0;
-	// First, establish the list of clients.
+	struct wtc_tmux_cb_closure cb;
 	const char *cmd[] = { "list-clients", "-F",
 	                      "#{session_id} #{client_pid} |#{client_name}",
 	                      NULL };
@@ -595,7 +655,6 @@ int wtc_tmux_reload_clients(struct wtc_tmux *tmux)
 	HASH_ITER(hh, tmux->clients, client, tmp) {
 		client->previous = NULL;
 		client->next = NULL;
-		client->session = NULL;
 
 		for (int i = 0; i < count; ++i) {
 			if (client->pid == cpids[i]) {
@@ -670,7 +729,18 @@ int wtc_tmux_reload_clients(struct wtc_tmux *tmux)
 			client->previous = prev;
 		}
 
-		client->session = sess;
+		if (client->session != sess) {
+			client->session = sess;
+
+			cb.fid = WTC_TMUX_CB_CLIENT_SESSION_CHANGED;
+			cb.tmux = tmux;
+			cb.value.client = client;
+			cb.free_after_use = false;
+			r = wtc_tmux_add_closure(tmux, cb);
+			if (r < 0)
+				goto err_ids;
+		}
+
 		prev = client;
 	}
 
@@ -690,7 +760,7 @@ err_out:
 int wtc_tmux_reload_sessions(struct wtc_tmux *tmux)
 {
 	int r = 0;
-	// First, establish the list of sessions.
+	struct wtc_tmux_cb_closure cb;
 	const char *const cmd[] = { "list-sessions", "-F", "#{session_id}",
 	                            NULL };
 	char *out = NULL;
@@ -716,7 +786,14 @@ int wtc_tmux_reload_sessions(struct wtc_tmux *tmux)
 		}
 
 		HASH_DEL(tmux->sessions, sess);
-		wtc_tmux_session_free(sess);
+
+		cb.fid = WTC_TMUX_CB_SESSION_CLOSED;
+		cb.tmux = tmux;
+		cb.value.session = sess;
+		cb.free_after_use = true;
+		r = wtc_tmux_add_closure(tmux, cb);
+		if (r < 0)
+			goto err_sids;
 
 		icont: ;
 	}
@@ -733,6 +810,14 @@ int wtc_tmux_reload_sessions(struct wtc_tmux *tmux)
 		}
 		sess->id = sids[i];
 		HASH_ADD_INT(tmux->sessions, id, sess);
+
+		cb.fid = WTC_TMUX_CB_NEW_SESSION;
+		cb.tmux = tmux;
+		cb.value.session = sess;
+		cb.free_after_use = false;
+		r = wtc_tmux_add_closure(tmux, cb);
+		if (r < 0)
+			goto err_sids;
 	}
 
 	bool gstatus = true;
@@ -804,16 +889,15 @@ int wtc_tmux_refresh_cb(int fd, uint32_t mask, void *userdata)
 	if (tmux->refresh & WTC_TMUX_REFRESH_SESSIONS) {
 		r = wtc_tmux_reload_sessions(tmux);
 		if (r < 0)
-			return r;
+			goto exit;
 
 		tmux->refresh = 0;
-		return 0;
 	}
 
 	if (tmux->refresh & WTC_TMUX_REFRESH_WINDOWS) {
 		r = wtc_tmux_reload_windows(tmux);
 		if (r < 0)
-			return r;
+			goto exit;
 
 		tmux->refresh &= ~(WTC_TMUX_REFRESH_WINDOWS |
 		                   WTC_TMUX_REFRESH_PANES);
@@ -822,7 +906,7 @@ int wtc_tmux_refresh_cb(int fd, uint32_t mask, void *userdata)
 	if (tmux->refresh & WTC_TMUX_REFRESH_PANES) {
 		r = wtc_tmux_reload_panes(tmux);
 		if (r < 0)
-			return r;
+			goto exit;
 
 		tmux->refresh &= ~WTC_TMUX_REFRESH_PANES;
 	}
@@ -830,14 +914,22 @@ int wtc_tmux_refresh_cb(int fd, uint32_t mask, void *userdata)
 	if (tmux->refresh & WTC_TMUX_REFRESH_CLIENTS) {
 		r = wtc_tmux_reload_clients(tmux);
 		if (r < 0)
-			return r;
+			goto exit;
 
 		tmux->refresh &= ~WTC_TMUX_REFRESH_CLIENTS;
 	}
 
 	assert(tmux->refresh == 0);
 
-	return 0;
+	for (size_t i = 0; i < tmux->closure_size; ++i) {
+		r = wtc_tmux_closure_invoke(&(tmux->closures[i]));
+		if (r)
+			break;
+	}
+
+exit:
+	wtc_tmux_clear_closures(tmux);
+	return r;
 }
 
 int wtc_tmux_queue_refresh(struct wtc_tmux *tmux, int flags)

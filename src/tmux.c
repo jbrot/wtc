@@ -607,18 +607,8 @@ unsigned int wtc_tmux_get_height(const struct wtc_tmux *tmux)
 	return tmux->h;
 }
 
-int wtc_tmux_set_new_client_cb(struct wtc_tmux *tmux,
-	void (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_client *client))
-{
-	if (!tmux)
-		return -EINVAL;
-
-	tmux->cbs.new_client = cb;
-	return 0;
-}
-
 int wtc_tmux_set_client_session_changed_cb(struct wtc_tmux *tmux,
-	void (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_client *client))
+	int (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_client *client))
 {
 	if (!tmux)
 		return -EINVAL;
@@ -628,7 +618,7 @@ int wtc_tmux_set_client_session_changed_cb(struct wtc_tmux *tmux,
 }
 
 int wtc_tmux_set_new_session_cb(struct wtc_tmux *tmux,
-	void (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_session *sess))
+	int (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_session *sess))
 {
 	if (!tmux)
 		return -EINVAL;
@@ -638,7 +628,7 @@ int wtc_tmux_set_new_session_cb(struct wtc_tmux *tmux,
 }
 
 int wtc_tmux_set_session_closed_cb(struct wtc_tmux *tmux,
-	void (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_session *sess))
+	int (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_session *sess))
 {
 	if (!tmux)
 		return -EINVAL;
@@ -647,7 +637,7 @@ int wtc_tmux_set_session_closed_cb(struct wtc_tmux *tmux,
 }
 
 int wtc_tmux_set_session_window_changed_cb(struct wtc_tmux *tmux,
-	void (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_session *sess))
+	int (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_session *sess))
 {
 	if (!tmux)
 		return -EINVAL;
@@ -656,7 +646,7 @@ int wtc_tmux_set_session_window_changed_cb(struct wtc_tmux *tmux,
 }
 
 int wtc_tmux_set_new_window_cb(struct wtc_tmux *tmux,
-	void (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_window *window))
+	int (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_window *window))
 {
 	if (!tmux)
 		return -EINVAL;
@@ -665,24 +655,16 @@ int wtc_tmux_set_new_window_cb(struct wtc_tmux *tmux,
 }
 
 int wtc_tmux_set_window_closed_cb(struct wtc_tmux *tmux,
-	void (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_window *window))
+	int (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_window *window))
 {
 	if (!tmux)
 		return -EINVAL;
 
 	tmux->cbs.window_closed = cb;
 }
-int wtc_tmux_set_window_layout_changed_cb(struct wtc_tmux *tmux,
-	void (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_window *window))
-{
-	if (!tmux)
-		return -EINVAL;
-
-	tmux->cbs.window_layout_changed = cb;
-}
 
 int wtc_tmux_set_window_pane_changed_cb(struct wtc_tmux *tmux,
-	void (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_window *window))
+	int (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_window *window))
 {
 	if (!tmux)
 		return -EINVAL;
@@ -690,8 +672,35 @@ int wtc_tmux_set_window_pane_changed_cb(struct wtc_tmux *tmux,
 	tmux->cbs.window_pane_changed = cb;
 }
 
+int wtc_tmux_set_new_pane_cb(struct wtc_tmux *tmux,
+	int (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_pane *pane))
+{
+	if (!tmux)
+		return -EINVAL;
+
+	tmux->cbs.new_pane= cb;
+}
+
+int wtc_tmux_set_pane_closed_cb(struct wtc_tmux *tmux,
+	int (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_pane *pane))
+{
+	if (!tmux)
+		return -EINVAL;
+
+	tmux->cbs.pane_closed = cb;
+}
+
+int wtc_tmux_set_pane_resized_cb(struct wtc_tmux *tmux,
+	int (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_pane *pane))
+{
+	if (!tmux)
+		return -EINVAL;
+
+	tmux->cbs.pane_resized= cb;
+}
+
 int wtc_tmux_set_pane_mode_changed_cb(struct wtc_tmux *tmux,
-	void (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_pane *pane))
+	int (*cb)(struct wtc_tmux *tmux, const struct wtc_tmux_pane *pane))
 {
 	if (!tmux)
 		return -EINVAL;
@@ -703,4 +712,178 @@ const struct wtc_tmux_session *
 wtc_tmux_root_session(const struct wtc_tmux *tmux)
 {
 	return tmux->sessions;
+}
+
+int wtc_tmux_add_closure(struct wtc_tmux *tmux,
+                         struct wtc_tmux_cb_closure cl)
+{
+	struct wtc_tmux_cb_closure *tmp;
+
+	if (!tmux)
+		return -EINVAL;
+
+	if (++(tmux->closure_size) <= tmux->closure_len) {
+		tmux->closures[tmux->closure_size - 1] = cl;
+		return 0;
+	}
+
+	if (tmux->closure_len == 0)
+		tmux->closure_len = 5;
+	else
+		tmux->closure_len *= 2;
+
+	tmp = realloc(tmux->closures, tmux->closure_len * 
+	                              sizeof(struct wtc_tmux_cb_closure));
+	if (!tmp) {
+		crit("wtc_tmux_add_closure: Couldn't allocate tmux->closures!");
+		return -ENOMEM;
+	}
+
+	tmux->closures = tmp;
+	tmux->closures[tmux->closure_size - 1] = cl;
+
+	return 0;
+}
+
+int wtc_tmux_closure_invoke(struct wtc_tmux_cb_closure *cl)
+{
+	int r = 0;
+	int p = -1; // 0 - pane; 1 - window; 2 - session; 3 - client
+
+	if (!cl)
+		return -EINVAL;
+
+	struct wtc_tmux *tmux = cl->tmux;
+	switch (cl->fid) {
+	case WTC_TMUX_CB_CLIENT_SESSION_CHANGED:
+		p = 3;
+		if (tmux->cbs.client_session_changed)
+			r = tmux->cbs.client_session_changed(tmux, cl->value.client);
+		break;
+
+	case WTC_TMUX_CB_NEW_SESSION:
+		p = 2;
+		if (tmux->cbs.new_session)
+			r = tmux->cbs.new_session(tmux, cl->value.session);
+		break;
+	case WTC_TMUX_CB_SESSION_CLOSED:
+		p = 2;
+		if (tmux->cbs.session_closed)
+			r = tmux->cbs.session_closed(tmux, cl->value.session);
+		break;
+	case WTC_TMUX_CB_SESSION_WINDOW_CHANGED:
+		p = 2;
+		if (tmux->cbs.session_window_changed)
+			r = tmux->cbs.session_window_changed(tmux, cl->value.session);
+		break;
+
+	case WTC_TMUX_CB_NEW_WINDOW:
+		p = 1;
+		if (tmux->cbs.new_window)
+			r = tmux->cbs.new_window(tmux, cl->value.window);
+		break;
+	case WTC_TMUX_CB_WINDOW_CLOSED:
+		p = 1;
+		if (tmux->cbs.window_closed)
+			r = tmux->cbs.window_closed(tmux, cl->value.window);
+		break;
+	case WTC_TMUX_CB_WINDOW_PANE_CHANGED:
+		p = 1;
+		if (tmux->cbs.window_pane_changed)
+			r = tmux->cbs.window_pane_changed(tmux, cl->value.window);
+		break;
+
+	case WTC_TMUX_CB_NEW_PANE:
+		p = 0;
+		if (tmux->cbs.new_pane)
+			r = tmux->cbs.new_pane(tmux, cl->value.pane);
+		break;
+	case WTC_TMUX_CB_PANE_CLOSED:
+		p = 0;
+		if (tmux->cbs.pane_closed)
+			r = tmux->cbs.pane_closed(tmux, cl->value.pane);
+		break;
+	case WTC_TMUX_CB_PANE_RESIZED:
+		p = 0;
+		if (tmux->cbs.pane_resized)
+			r = tmux->cbs.pane_resized(tmux, cl->value.pane);
+		break;
+	case WTC_TMUX_CB_PANE_MODE_CHANGED:
+		p = 0;
+		if (tmux->cbs.pane_mode_changed)
+			r = tmux->cbs.pane_mode_changed(tmux, cl->value.pane);
+		break;
+
+	case WTC_TMUX_CB_EMPTY:
+	default:
+		break;
+	}
+
+	if (r != 0)
+		return r;
+
+	cl->fid = WTC_TMUX_CB_EMPTY;
+	if (!cl->free_after_use)
+		return r;
+
+	cl->free_after_use = false;
+	switch (p) {
+	case 0:
+		wtc_tmux_pane_free(cl->value.pane);
+		cl->value.pane = NULL;
+		break;
+	case 1:
+		wtc_tmux_window_free(cl->value.window);
+		cl->value.window = NULL;
+		break;
+	case 2:
+		wtc_tmux_session_free(cl->value.session);
+		cl->value.session = NULL;
+		break;
+	case 3:
+		wtc_tmux_client_free(cl->value.client);
+		cl->value.client = NULL;
+		break;
+	default:
+		break;
+	}
+
+	return r;
+}
+
+void wtc_tmux_clear_closures(struct wtc_tmux *tmux)
+{
+	if (!tmux)
+		return;
+
+	struct wtc_tmux_cb_closure cb;
+	for (size_t i = 0; i < tmux->closure_size; ++i) {
+		cb = tmux->closures[i];
+		if (cb.fid == WTC_TMUX_CB_EMPTY || !cb.free_after_use)
+			continue;
+
+		switch (cb.fid) {
+		case WTC_TMUX_CB_CLIENT_SESSION_CHANGED:
+			wtc_tmux_client_free(cb.value.client);
+			break;
+		case WTC_TMUX_CB_NEW_SESSION:
+		case WTC_TMUX_CB_SESSION_CLOSED:
+		case WTC_TMUX_CB_SESSION_WINDOW_CHANGED:
+			wtc_tmux_session_free(cb.value.session);
+			break;
+		case WTC_TMUX_CB_NEW_WINDOW:
+		case WTC_TMUX_CB_WINDOW_CLOSED:
+		case WTC_TMUX_CB_WINDOW_PANE_CHANGED:
+			wtc_tmux_window_free(cb.value.window);
+			break;
+		case WTC_TMUX_CB_NEW_PANE:
+		case WTC_TMUX_CB_PANE_CLOSED:
+		case WTC_TMUX_CB_PANE_RESIZED:
+		case WTC_TMUX_CB_PANE_MODE_CHANGED:
+			wtc_tmux_pane_free(cb.value.pane);
+			break;
+		}
+	}
+
+	tmux->closure_size = 0;
 }

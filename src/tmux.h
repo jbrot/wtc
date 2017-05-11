@@ -356,32 +356,31 @@ unsigned int wtc_tmux_get_height(const struct wtc_tmux *tmux);
  * after all references to the passed object have been cleaned up. The
  * passed object will be freed after the callback completes.
  */
-int wtc_tmux_set_new_client_cb(struct wtc_tmux *tmux,
-	void (*cb)(struct wtc_tmux *, const struct wtc_tmux_client *));
 int wtc_tmux_set_client_session_changed_cb(struct wtc_tmux *tmux,
-	void (*cb)(struct wtc_tmux *, const struct wtc_tmux_client *));
+	int (*cb)(struct wtc_tmux *, const struct wtc_tmux_client *));
 
 int wtc_tmux_set_new_session_cb(struct wtc_tmux *tmux,
-	void (*cb)(struct wtc_tmux *, const struct wtc_tmux_session *));
+	int (*cb)(struct wtc_tmux *, const struct wtc_tmux_session *));
 int wtc_tmux_set_session_closed_cb(struct wtc_tmux *tmux,
-	void (*cb)(struct wtc_tmux *, const struct wtc_tmux_session *));
+	int (*cb)(struct wtc_tmux *, const struct wtc_tmux_session *));
 int wtc_tmux_set_session_window_changed_cb(struct wtc_tmux *tmux,
-	void (*cb)(struct wtc_tmux *, const struct wtc_tmux_session *));
+	int (*cb)(struct wtc_tmux *, const struct wtc_tmux_session *));
 
 int wtc_tmux_set_new_window_cb(struct wtc_tmux *tmux,
-	void (*cb)(struct wtc_tmux *, const struct wtc_tmux_window *));
+	int (*cb)(struct wtc_tmux *, const struct wtc_tmux_window *));
 int wtc_tmux_set_window_closed_cb(struct wtc_tmux *tmux,
-	void (*cb)(struct wtc_tmux *, const struct wtc_tmux_window *));
-int wtc_tmux_set_window_layout_changed_cb(struct wtc_tmux *tmux,
-	void (*cb)(struct wtc_tmux *, const struct wtc_tmux_window *));
+	int (*cb)(struct wtc_tmux *, const struct wtc_tmux_window *));
 int wtc_tmux_set_window_pane_changed_cb(struct wtc_tmux *tmux,
-	void (*cb)(struct wtc_tmux *, const struct wtc_tmux_window *));
-/*
- * Pane creation and destruction should be tracked via the
- * layout_changed_cb.
- */
+	int (*cb)(struct wtc_tmux *, const struct wtc_tmux_window *));
+
+int wtc_tmux_set_new_pane_cb(struct wtc_tmux *tmux,
+	int (*cb)(struct wtc_tmux *, const struct wtc_tmux_pane *));
+int wtc_tmux_set_pane_closed_cb(struct wtc_tmux *tmux,
+	int (*cb)(struct wtc_tmux *, const struct wtc_tmux_pane *));
+int wtc_tmux_set_pane_resized_cb(struct wtc_tmux *tmux,
+	int (*cb)(struct wtc_tmux *, const struct wtc_tmux_pane *));
 int wtc_tmux_set_pane_mode_changed_cb(struct wtc_tmux *tmux,
-	void (*cb)(struct wtc_tmux *, const struct wtc_tmux_pane *));
+	int (*cb)(struct wtc_tmux *, const struct wtc_tmux_pane *));
 
 /*
  * The following lookup functions can be used after a connection has been
