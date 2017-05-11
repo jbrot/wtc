@@ -84,14 +84,20 @@ static void print_ring(struct shl_ring *ring) {
 static int cc_cb(int fd, uint32_t mask, void *userdata)
 {
 	struct wtc_tmux_cc *cc = userdata;
-	debug("CB: %d", fd);
+	debug("cc_cb: %d", fd);
 	if (mask & WL_EVENT_READABLE) {
-		debug("Readable : %d", fd);
+		debug("cc_cb: Readable : %d", fd);
 		int r = read_available(fd, WTC_RDAVL_CSTRING | WTC_RDAVL_RING,
 		                       NULL, &cc->buf);
-		if (r)
-			warn("Read error: %d", r);
+		if (r) {
+			warn("cc_cb: Read error: %d", r);
+			return r;
+		}
+
 		print_ring(&(cc->buf));
+		r = wtc_tmux_cc_process_output(cc);
+		if (r)
+			return r;
 	}
 	if (mask & (WL_EVENT_HANGUP | WL_EVENT_ERROR)) {
 		if (mask & WL_EVENT_HANGUP)

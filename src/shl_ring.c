@@ -13,7 +13,16 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define RING_MASK(_r, _v) ((_v) & ((_r)->size - 1))
+/*
+ * SHL_RING_MASK(ring, position) ensures position is the correct index in
+ * the array. It will compensate for the ring edge.
+ */
+#define SHL_RING_MASK(_r, _v) ((_v) & ((_r)->size - 1))
+
+bool shl_ring_empty(struct shl_ring *r)
+{
+	return r->start == r->end;
+}
 
 /*
  * Resize ring-buffer to size @nsize. @nsize must be a power-of-2, otherwise
@@ -115,7 +124,7 @@ int shl_ring_push(struct shl_ring *r, const char *u8, size_t len)
 			l = len;
 
 		memcpy(&r->buf[r->end], u8, l);
-		r->end = RING_MASK(r, r->end + l);
+		r->end = SHL_RING_MASK(r, r->end + l);
 
 		len -= l;
 		u8 += l;
@@ -125,7 +134,7 @@ int shl_ring_push(struct shl_ring *r, const char *u8, size_t len)
 		return 0;
 
 	memcpy(&r->buf[r->end], u8, len);
-	r->end = RING_MASK(r, r->end + len);
+	r->end = SHL_RING_MASK(r, r->end + len);
 
 	return 0;
 }
@@ -156,7 +165,7 @@ void shl_ring_pop(struct shl_ring *r, size_t len)
 		if (l > len)
 			l = len;
 
-		r->start = RING_MASK(r, r->start + l);
+		r->start = SHL_RING_MASK(r, r->start + l);
 		len -= l;
 	}
 
@@ -167,5 +176,5 @@ void shl_ring_pop(struct shl_ring *r, size_t len)
 	if (l > len)
 		l = len;
 
-	r->start = RING_MASK(r, r->start + l);
+	r->start = SHL_RING_MASK(r, r->start + l);
 }

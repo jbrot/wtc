@@ -81,7 +81,7 @@ int read_available(int fd, int mode, int *size, void *out)
 			tmp = *((char **) out);
 			if (tmp && (mode & WTC_RDAVL_CSTRING)) {
 				pos = strlen(tmp);
-			} else if (tmp && (mode & WTC_RDAVL_BUF)) {
+			} else if (tmp && (mode & WTC_RDAVL_STANDARD)) {
 				if (!size || *size < 0)
 					return -EINVAL;
 				pos = *size;
@@ -90,7 +90,7 @@ int read_available(int fd, int mode, int *size, void *out)
 			}
 
 			len = npo2(pos);
-			len = len < 128 ? 128 : pos;
+			len = len < 128 ? 128 : len;
 		}
 	}
 
@@ -141,7 +141,7 @@ int read_available(int fd, int mode, int *size, void *out)
 		if (pos != len)
 			break;
 
-		if (disc || (mode & WTC_RDAVL_CSTRING)) {
+		if (disc || (mode & WTC_RDAVL_RING)) {
 			pos = 0;
 			continue;
 		}

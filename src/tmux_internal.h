@@ -86,6 +86,14 @@ struct wtc_tmux {
 	struct wlc_event_source *sigc;
 	struct wtc_tmux_cc *ccs;
 
+	int refresh;
+#define WTC_TMUX_REFRESH_PANES    (1<<0)
+#define WTC_TMUX_REFRESH_WINDOWS  (1<<1)
+#define WTC_TMUX_REFRESH_SESSIONS (1<<2)
+#define WTC_TMUX_REFRESH_CLIENTS  (1<<3)
+	int refreshfd;
+	struct wlc_event_source *rfev;
+
 	char *bin;
 	char *socket;
 	char *socket_path;
@@ -260,5 +268,23 @@ int wtc_tmux_reload_clients(struct wtc_tmux *tmux);
  * TODO Possibly patch tmux to allow atomic queries.
  */
 int wtc_tmux_reload_sessions(struct wtc_tmux *tmux);
+
+/*
+ * This function gets called whenever a wtc_tmux_cc's process outputs data.
+ * It will process as much of the available data as possible. Returns 0 on
+ * success or a negative error code.
+ */
+int wtc_tmux_cc_process_output(struct wtc_tmux_cc *cc);
+
+/*
+ * Called to refresh part or all of the server state. userdata is
+ * a (struct wtc_tmux *).
+ */
+int wtc_tmux_refresh_cb(int fd, uint32_t mask, void *userdata);
+
+/*
+ * Schedule the specified flags to be refreshed.
+ */
+int wtc_tmux_queue_refresh(struct wtc_tmux *tmux, int flags);
 
 #endif // !WTC_TMUX_INTERNAL_H

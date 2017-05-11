@@ -33,6 +33,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <unistd.h>
 #include <wait.h>
 #include <wayland-server-core.h>
@@ -399,6 +400,55 @@ err_cmd:
 	return r;
 }
 
+static int setup_pipe(int *fds, struct wlc_event_source **ev,
+                      int (*cb)(int, uint32_t, void *), void *userdata)
+{
+	int r;
+
+	if (!fds || !ev)
+		return -EINVAL;
+
+	r = pipe2(fds, O_CLOEXEC);
+	if (r < 0) {
+		crit("setup_pipe: Couldn't open pipe: %d", errno);
+		return -errno;
+	}
+
+	for (int i = 0; i < 2; ++i) {
+		r = fcntl(fds[i], F_GETFL);
+		if (r < 0) {
+			crit("setup_pipe: Can't get fds[%d] flags: %d",
+			     i, errno);
+			r = -errno;
+			goto err_pipe;
+		}
+		r = fcntl(fds[i], F_SETFL, r | O_NONBLOCK);
+		if (r < 0) {
+			crit("setup_pipe: Can't set fds[i] O_NONBLOCK: %d",
+			     i, errno);
+			r = -errno;
+			goto err_pipe;
+		}
+	}
+
+	*ev = wlc_event_loop_add_fd(fds[0], WL_EVENT_READABLE | WL_EVENT_HANGUP,
+	                            cb, userdata);
+	if (!*ev) {
+		crit("setup_pipe: Couldn't register callback!");
+		r = -1;
+		goto err_pipe;
+	}
+
+	return 0;
+
+err_pipe:
+	if (close(fds[0]))
+		warn("setup_pipe: Error closing fds[0]: %d", errno);
+	if (close(fds[1]))
+		warn("setup_pipe: Error closing fds[1]: %d", errno);
+	return r;
+}
+
 int sigcpipe[2];
 
 static void sigchld_handler(int signal)
@@ -411,6 +461,7 @@ static void sigchld_handler(int signal)
 int wtc_tmux_connect(struct wtc_tmux *tmux)
 {
 	struct sigaction act;
+	int refreshfds[2];
 	int r = 0;
 
 	if (!tmux)
@@ -418,35 +469,15 @@ int wtc_tmux_connect(struct wtc_tmux *tmux)
 	if (tmux->connected)
 		return 0;
 
-	r = pipe2(sigcpipe, O_CLOEXEC);
-	if (r < 0) {
-		crit("wtc_tmux_connect: Couldn't open sigcpipe: %d", errno);
-		return -errno;
-	}
-	for (int i = 0; i < 2; ++i) {
-		r = fcntl(sigcpipe[i], F_GETFL);
-		if (r < 0) {
-			crit("wtc_tmux_connect: Can't get sigcpipe[%d] flags: %d",
-			     i, errno);
-			r = -errno;
-			goto err_pipe;
-		}
-		r = fcntl(sigcpipe[i], F_SETFL, r | O_NONBLOCK);
-		if (r < 0) {
-			crit("wtc_tmux_connect: Can't set sigcpipe[i] O_NONBLOCK: %d",
-			     i, errno);
-			r = -errno;
-			goto err_pipe;
-		}
-	}
+	r = setup_pipe(refreshfds, &(tmux->rfev), wtc_tmux_refresh_cb, tmux);
+	if (r < 0)
+		return r;
+	tmux->refresh = 0;
+	tmux->refreshfd = refreshfds[1];
 
-	tmux->sigc = wlc_event_loop_add_fd(sigcpipe[0], WL_EVENT_READABLE |
-	                                   WL_EVENT_HANGUP, sigc_cb, tmux);
-	if (!tmux->sigc) {
-		crit("wtc_tmux_connect: Could not register SIGCHLD callback!");
-		r = -1;
-		goto err_pipe;
-	}
+	r = setup_pipe(sigcpipe, &(tmux->sigc), sigc_cb, tmux);
+	if (r < 0)
+		goto err_rf;
 
 	memset(&act, 0, sizeof(struct sigaction));
 	act.sa_handler = sigchld_handler;
@@ -496,13 +527,13 @@ err_sig:
 err_evl:
 	wlc_event_source_remove(tmux->sigc);
 	tmux->sigc = NULL;
-	if (0) {
-err_pipe:
-		if (close(sigcpipe[0]))
-			warn("wtc_tmux_connect: Error closing sigcpipe[0]: %d", errno);
-	}
 	if (close(sigcpipe[1]))
 		warn("wtc_tmux_connect: Error closing sigcpipe[1]: %d", errno);
+err_rf:
+	wlc_event_source_remove(tmux->rfev);
+	tmux->rfev = NULL;
+	if (close(tmux->refreshfd))
+		warn("wtc_tmux_connect: Error closing refreshfd: %d", errno);
 	return r;
 }
 
@@ -515,10 +546,16 @@ int wtc_tmux_disconnect(struct wtc_tmux *tmux)
 
 	sigaction(SIGCHLD, &tmux->restore, NULL);
 	memset(&tmux->restore, 0, sizeof(struct sigaction));
+
 	wlc_event_source_remove(tmux->sigc);
 	tmux->sigc = NULL;
 	if (close(sigcpipe[1]))
 		warn("wtc_tmux_disconnect: Error closing sigcpipe[1]: %d", errno);
+
+	wlc_event_source_remove(tmux->rfev);
+	tmux->rfev = NULL;
+	if (close(tmux->refreshfd))
+		warn("wtc_tmux_disconnect: Error closing refreshfd: %d", errno);
 	// TODO
 }
 

@@ -35,7 +35,9 @@
 #include "log.h"
 #include "rdavail.h"
 
+#include <assert.h>
 #include <errno.h>
+#include <unistd.h>
 
 int wtc_tmux_version_check(struct wtc_tmux *tmux)
 {
@@ -87,7 +89,7 @@ static int update_session_status(struct wtc_tmux *tmux,
 	char *out = NULL;
 	bool status, top;
 
-	r = wtc_tmux_get_option(tmux, "status", sess->id, 
+	r = wtc_tmux_get_option(tmux, "status", sess->id,
 	                        WTC_TMUX_OPTION_SESSION, &out);
 	if (r)
 		goto err_out;
@@ -753,8 +755,8 @@ int wtc_tmux_reload_sessions(struct wtc_tmux *tmux)
 		}
 
 		free(out); out = NULL;
-		r = wtc_tmux_get_option(tmux, "status-position", 0, 
-		                        WTC_TMUX_OPTION_GLOBAL | 
+		r = wtc_tmux_get_option(tmux, "status-position", 0,
+		                        WTC_TMUX_OPTION_GLOBAL |
 		                        WTC_TMUX_OPTION_SESSION, &out);
 		if (r)
 			goto err_sids;
@@ -787,4 +789,262 @@ err_sids:
 err_out:
 	free(out);
 	return r;
+}
+
+int wtc_tmux_refresh_cb(int fd, uint32_t mask, void *userdata)
+{
+	struct wtc_tmux *tmux = userdata;
+
+	int r = read_available(fd, WTC_RDAVL_DISCARD, NULL, NULL);
+	if (r < 0) {
+		warn("wtc_tmux_refresh_cb: Error clearing pipe: %d", r);
+		return r;
+	}
+
+	if (tmux->refresh & WTC_TMUX_REFRESH_SESSIONS) {
+		r = wtc_tmux_reload_sessions(tmux);
+		if (r < 0)
+			return r;
+
+		tmux->refresh = 0;
+		return 0;
+	}
+
+	if (tmux->refresh & WTC_TMUX_REFRESH_WINDOWS) {
+		r = wtc_tmux_reload_windows(tmux);
+		if (r < 0)
+			return r;
+
+		tmux->refresh &= ~(WTC_TMUX_REFRESH_WINDOWS |
+		                   WTC_TMUX_REFRESH_PANES);
+	}
+
+	if (tmux->refresh & WTC_TMUX_REFRESH_PANES) {
+		r = wtc_tmux_reload_panes(tmux);
+		if (r < 0)
+			return r;
+
+		tmux->refresh &= ~WTC_TMUX_REFRESH_PANES;
+	}
+
+	if (tmux->refresh & WTC_TMUX_REFRESH_CLIENTS) {
+		r = wtc_tmux_reload_clients(tmux);
+		if (r < 0)
+			return r;
+
+		tmux->refresh &= ~WTC_TMUX_REFRESH_CLIENTS;
+	}
+
+	assert(tmux->refresh == 0);
+
+	return 0;
+}
+
+int wtc_tmux_queue_refresh(struct wtc_tmux *tmux, int flags)
+{
+	int r;
+
+	tmux->refresh |= flags;
+	r = write(tmux->refreshfd, "", 1);
+	if (r < 0) {
+		warn("wtc_tmux_queue_refresh: Error writing to pipe: %d", errno);
+		return -errno;
+	}
+
+	return 0;
+}
+
+
+#define TMUX_CC_BEGIN                    1
+#define TMUX_CC_END                      2
+#define TMUX_CC_CLIENT_SESSION_CHANGED   3
+#define TMUX_CC_EXIT                     4
+#define TMUX_CC_LAYOUT_CHANGE            5
+#define TMUX_CC_OUTPUT                   6
+#define TMUX_CC_PANE_MODE_CHANGED        7
+#define TMUX_CC_SESSION_CHANGED          8
+#define TMUX_CC_SESSION_RENAMED          9
+#define TMUX_CC_SESSION_WINDOW_CHANGED  10
+#define TMUX_CC_SESSIONS_CHANGED        11
+#define TMUX_CC_UNLINKED_WINDOW_ADD     12
+#define TMUX_CC_UNLINKED_WINDOW_CLOSE   13
+#define TMUX_CC_UNLINKED_WINDOW_RENAMED 14
+#define TMUX_CC_WINDOW_ADD              15
+#define TMUX_CC_WINDOW_CLOSE            16
+#define TMUX_CC_WINDOW_PANE_CHANGED     17
+#define TMUX_CC_WINDOW_RENAMED          18
+
+/*
+ * The names of all of the commands, omitting the starting %.
+ * tmux_cc_names[i] corresponds with command number i + 1.
+ */
+static const char * const CC_NAMES[] = { "begin", "end",
+	"client-session-changed", "exit", "layout-change", "output",
+	"pane-mode-changed", "session-changed", "session-renamed",
+	"session-window-changed", "sessions-changed", "unlinked-window-add",
+	"unlinked-window-close", "unlinked-window-renamed", "window-add", 
+	"window-close", "window-pane-changed", "window-renamed" };
+static const int CC_NAMES_LEN = sizeof(CC_NAMES) / sizeof(*CC_NAMES);
+
+/*
+ * Scan the start of the start of the ring buffer for the command name. If
+ * the command is successfully identified, returns a positice command id.
+ * If there is not enough data to fully identifiy the command, returns 0.
+ * If there is an invalid/unrecognized command, returns -EINVAL.
+ */
+static int identify_command(struct wtc_tmux_cc *cc)
+{
+	struct shl_ring *ring = &(cc->buf);
+
+	struct iovec vecs[2];
+	size_t size, pos, len;
+	char val;
+	int match; // 0 - false, 1 - true, 2 - incomplete
+
+	// Ensure the ring is non-empty
+	if (shl_ring_empty(ring))
+		return 0;
+
+	for (int i = 0; i < CC_NAMES_LEN; ++i) {
+		match = 2;
+		len = strlen(CC_NAMES[i]);
+		int j = -1;
+		SHL_RING_ITERATE(ring, val, vecs, size, pos) {
+			if (val == '\0')
+				continue;
+
+			if (j == -1) {
+				if (val != '%')
+					return -EINVAL;
+
+				++j;
+				continue;
+			}
+
+			if (j == len) {
+				match = val == ' ' || val == '\n';
+				break;
+			}
+
+			if (val != CC_NAMES[i][j]) {
+				match = 0;
+				break;
+			}
+
+			++j;
+		}
+
+		if (match == 2)
+			return 0;
+		else if (match == 1)
+			return i + 1;
+	}
+
+	return -EINVAL;
+}
+
+/*
+ * Remove the line at the start of the input of the buffer. Returns 0
+ * if there is not a complete line, otherwise returns the number of
+ * characters removed.
+ */
+static int consume_line(struct wtc_tmux_cc *cc)
+{
+	struct shl_ring *ring = &(cc->buf);
+
+	struct iovec vecs[2];
+	size_t size, pos;
+	char val;
+
+	SHL_RING_ITERATE(ring, val, vecs, size, pos) {
+		if (val != '\n')
+			continue;
+
+		shl_ring_pop(ring, pos + 1);
+		return pos + 1;
+	}
+
+	return 0;
+}
+
+static int process_cmd_begin(struct wtc_tmux_cc *cc)
+{
+	return consume_line(cc);
+}
+
+int wtc_tmux_cc_process_output(struct wtc_tmux_cc *cc)
+{
+	if (!cc)
+		return -EINVAL;
+
+	struct wtc_tmux *tmux = cc->tmux;
+
+	int cmd = 0;
+	int r = 0;
+	while ((cmd = identify_command(cc)) > 0) {
+		debug("wtc_tmux_cc_process_output: Identified command: %d",
+		      cmd);
+		switch (cmd) {
+		case TMUX_CC_BEGIN:
+			r = process_cmd_begin(cc);
+			if (r <= 0)
+				return r;
+			break;
+		case TMUX_CC_CLIENT_SESSION_CHANGED:
+			r = consume_line(cc);
+			if (r <= 0)
+				return r;
+			r = wtc_tmux_queue_refresh(tmux, WTC_TMUX_REFRESH_CLIENTS);
+			if (r < 0)
+				return r;
+			break;
+		case TMUX_CC_LAYOUT_CHANGE:
+		case TMUX_CC_PANE_MODE_CHANGED:
+		case TMUX_CC_WINDOW_PANE_CHANGED:
+			r = consume_line(cc);
+			if (r <= 0)
+				return r;
+			r = wtc_tmux_queue_refresh(tmux, WTC_TMUX_REFRESH_PANES);
+			if (r < 0)
+				return r;
+			break;
+		case TMUX_CC_SESSION_WINDOW_CHANGED:
+		case TMUX_CC_SESSIONS_CHANGED:
+			r = consume_line(cc);
+			if (r <= 0)
+				return r;
+			r = wtc_tmux_queue_refresh(tmux, WTC_TMUX_REFRESH_SESSIONS);
+			if (r < 0)
+				return r;
+			break;
+		case TMUX_CC_WINDOW_ADD:
+		case TMUX_CC_WINDOW_CLOSE:
+		case TMUX_CC_UNLINKED_WINDOW_ADD:
+		case TMUX_CC_UNLINKED_WINDOW_CLOSE:
+			r = consume_line(cc);
+			if (r <= 0)
+				return r;
+			r = wtc_tmux_queue_refresh(tmux, WTC_TMUX_REFRESH_WINDOWS);
+			if (r < 0)
+				return r;
+			break;
+		case TMUX_CC_END: // This should be consumed when processing begin
+		case TMUX_CC_OUTPUT:
+		case TMUX_CC_SESSION_CHANGED:
+		case TMUX_CC_SESSION_RENAMED:
+		case TMUX_CC_UNLINKED_WINDOW_RENAMED:
+		case TMUX_CC_WINDOW_RENAMED:
+		default:
+			if (!consume_line(cc))
+				return 0;
+		}
+	}
+
+	if (cmd < 0) {
+		warn("wtc_tmux_cc_process_output: Couldn't identify command!");
+		consume_line(cc); // So we can attempt to move on
+		return cmd;
+	}
+
+	return 0;
 }
