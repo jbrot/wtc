@@ -15,7 +15,6 @@
 #include <stdbool.h>
 #include <sys/uio.h>
 
-// TODO perhaps this should be opaque and have ref counting.
 struct shl_ring {
 	char *buf;
 	size_t size;

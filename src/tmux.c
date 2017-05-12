@@ -33,6 +33,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <unistd.h>
 #include <wait.h>
@@ -111,7 +112,6 @@ static int sigc_cb(int fd, uint32_t mask, void *userdata)
 				// TODO possible no session handler
 			}
 
-			// TODO possible client disconnect cb
 			wtc_tmux_cc_unref(cc);
 			break;
 		}
@@ -130,7 +130,7 @@ int wtc_tmux_new(struct wtc_tmux **out)
 
 	output->ref = 1;
 
-	output->timeout = 10000;
+	output->timeout = 5000;
 	output->w = 80;
 	output->h = 24;
 
@@ -425,6 +425,9 @@ err_pipe:
 	return r;
 }
 
+// TODO Find a way to make multiple tmux instances share this. Albeit this
+// may just be a stupid idea (and I doubt it's a feature I'll ever use), but
+// it might be fun to work out.
 int sigcpipe[2];
 
 static void sigchld_handler(int signal)
@@ -432,6 +435,63 @@ static void sigchld_handler(int signal)
 	int save_errno = errno;
 	write(sigcpipe[1], "", 1);
 	errno = save_errno;
+}
+
+int wtc_tmux_waitpid(struct wtc_tmux *tmux, pid_t pid, int *stat, int opt)
+{
+	int r = 0;
+
+	if (!tmux || pid <= 0)
+		return -EINVAL;
+
+	struct pollfd pol = { .fd = sigcpipe[0], .events = POLLIN,
+	                      .revents = 0 };
+	bool reflag = false, success = false;
+	while (r = poll(&pol, 1, tmux->timeout)) {
+		if (r == -1) {
+			if (errno == EINTR)
+				continue;
+			warn("wtc_tmux_waitpid: Error waiting for sigc: %d", errno);
+			r = -errno;
+			goto out;
+		}
+
+		r = read_available(pol.fd, WTC_RDAVL_DISCARD, NULL, NULL);
+		if (r < 0) {
+			warn("wtc_tmux_waitpid: Error clearing SIGCHLD pipe: %d", r);
+			return r;
+		}
+
+		r = waitpid(pid, stat, opt | WNOHANG);
+		if (r < 0) {
+			warn("wtc_tmux_waitpid: waitpid error: %d", errno);
+			r = -errno;
+			goto out;
+		} else if (r == 0) {
+			reflag = 1;
+		} else {
+			success = true;
+			break;
+		}
+	}
+
+	if (!success) {
+		warn("wtc_tmux_waitpid: Wait for %d timed out. Killing...", pid);
+		kill(pid, SIGKILL);
+		while ((r = waitpid(pid, stat, opt & ~WNOHANG)) == -1 &&
+		       errno == EINTR) ;
+		if (r == -1)
+			warn("wtc_tmux_waitpid: waitpid error: %d", errno);
+	}
+
+out:
+	if (reflag) {
+		int s;
+		while ((s = write(sigcpipe[1], "", 1)) == -1 && errno == EINTR) ;
+		if (s == -1)
+			warn("wtc_tmux_waitpid: Error reflagging SIGCLD: %d", errno);
+	}
+	return r;
 }
 
 int wtc_tmux_connect(struct wtc_tmux *tmux)
@@ -511,6 +571,15 @@ void wtc_tmux_disconnect(struct wtc_tmux *tmux)
 	if (!tmux || !tmux->connected)
 		return;
 
+	struct wtc_tmux_cc *cc;
+	const char *cmd[] = { "detach-client", NULL };
+	for (cc = tmux->ccs; cc; cc = cc->next) {
+		wtc_tmux_cc_exec(cc, cmd, NULL, NULL);
+		wtc_tmux_waitpid(tmux, cc->pid, NULL, 0);
+		wtc_tmux_cc_unref(cc);
+	}
+	tmux->ccs = NULL;
+
 	sigaction(SIGCHLD, &tmux->restore, NULL);
 	memset(&tmux->restore, 0, sizeof(struct sigaction));
 
@@ -524,24 +593,10 @@ void wtc_tmux_disconnect(struct wtc_tmux *tmux)
 	if (close(tmux->refreshfd))
 		warn("wtc_tmux_disconnect: Error closing refreshfd: %d", errno);
 
-	int s;
-	struct wtc_tmux_cc *cc;
 	struct wtc_tmux_pane *pane, *tmpp;
 	struct wtc_tmux_window *window, *tmpw;
 	struct wtc_tmux_client *client, *tmpc;
 	struct wtc_tmux_session *sess, *tmps;
-;
-	for (cc = tmux->ccs; cc; cc = cc->next) {
-		// TODO kill more nicely?
-		kill(cc->pid, SIGKILL);
-		while ((s = waitpid(cc->pid, NULL, 0)) == -1 && errno == EINTR) ;
-		if (s == -1)
-			warn("wtc_tmux_disconnect: waitpid error for %d: %d",
-			     cc->pid, errno);
-
-		wtc_tmux_cc_unref(cc);
-	}
-	tmux->ccs = NULL;
 
 	HASH_ITER(hh, tmux->panes, pane, tmpp) {
 		HASH_DEL(tmux->panes, pane);

@@ -180,6 +180,16 @@ void wtc_tmux_window_free(struct wtc_tmux_window *window);
 void wtc_tmux_session_free(struct wtc_tmux_session *sess);
 void wtc_tmux_client_free(struct wtc_tmux_client *client);
 
+/*
+ * A specialized version of waitpid that will, after the timeout value in
+ * the object object elapses, kill the specified child to force termination.
+ *
+ * NOTE: tmux must not be NULL and pid must be positive (i.e., this will
+ * only work for a specific process and not an arbitrary process or process 
+ * group.
+ */
+int wtc_tmux_waitpid(struct wtc_tmux *tmux, pid_t pid, int *stat, int opt);
+
 int wtc_tmux_add_closure(struct wtc_tmux *, struct wtc_tmux_cb_closure);
 /*
  * Run the specified closure. Returns 0 on success and 1 on failure.
@@ -253,8 +263,6 @@ int wtc_tmux_fork(struct wtc_tmux *tmux, const char *const *cmds,
  * isn't explicit about which session/window/client/pane it is targeting
  * this may have unwanted side effecs. Furthermore, this will prevent
  * the version checking from working.
- *
- * TODO handle timeout
  */
 int wtc_tmux_exec(struct wtc_tmux *tmux, const char *const *cmds,
                   char **out, char **err);
