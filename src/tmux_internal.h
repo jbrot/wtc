@@ -154,11 +154,20 @@ struct wtc_tmux_cc {
 	pid_t pid;
 	bool temp;
 	int fin;
+	int fout; // This will be closed automatically when removing outs
 	struct wlc_event_source *outs;
 	struct shl_ring buf;
 
 	struct wtc_tmux_cc *previous;
 	struct wtc_tmux_cc *next;
+
+	/* 
+	 * This callback is invoked when the control process responds to
+	 * a command. This should probably not be used directly. Instead,
+	 * user wtc_tmux_cc_exec.
+	 */
+	void *userdata;
+	int (*cmd_cb)(struct wtc_tmux_cc *cc, size_t st, size_t l, bool err);
 };
 
 /*
@@ -233,11 +242,23 @@ int wtc_tmux_fork(struct wtc_tmux *tmux, const char *const *cmds,
  * their values changed, then the new value points to the complete output
  * on that stream and no errors were detected while processing it.
  *
+ * NOTE: If there exists an active control session, this calls
+ * wtc_tmux_cc_exec instead of launching a new process. If your command
+ * isn't explicit about which session/window/client/pane it is targeting
+ * this may have unwanted side effecs. Furthermore, this will prevent
+ * the version checking from working.
+ *
  * TODO handle timeout
- * TODO use control session instead of new process if possible.
  */
 int wtc_tmux_exec(struct wtc_tmux *tmux, const char *const *cmds,
                   char **out, char **err);
+
+/*
+ * Functionally equivalent to wtc_tmux_exec. However, instead of forking
+ * a new tmux instance, the command is run on the specified wtc_tmux_cc.
+ */
+int wtc_tmux_cc_exec(struct wtc_tmux_cc *cc, const char *const *cmds,
+                     char **out, char **err);
 
 /*
  * Retrieve the value of the option specified by name. The trailing newline

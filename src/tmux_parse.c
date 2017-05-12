@@ -1001,7 +1001,7 @@ static const int CC_NAMES_LEN = sizeof(CC_NAMES) / sizeof(*CC_NAMES);
 
 /*
  * Scan the start of the start of the ring buffer for the command name. If
- * the command is successfully identified, returns a positice command id.
+ * the command is successfully identified, returns a positive command id.
  * If there is not enough data to fully identifiy the command, returns 0.
  * If there is an invalid/unrecognized command, returns -EINVAL.
  */
@@ -1082,7 +1082,147 @@ static int consume_line(struct wtc_tmux_cc *cc)
 
 static int process_cmd_begin(struct wtc_tmux_cc *cc)
 {
-	return consume_line(cc);
+	struct shl_ring *ring = &(cc->buf);
+	char begin[] = "%begin ";
+	char end[] = "%end ";
+	char error[] = "%error ";
+
+	struct iovec vecs[2];
+	size_t size, pos;
+	char val;
+
+	size_t start = 0;
+	size_t len = 0;
+
+	int guard = 0;
+	long time[2] = {0};
+	int cmd[2]   = {0};
+	int flags[2] = {0};
+
+	// 0 - text, 1 - time, 2 - cmd, 3 - flags, 4 - unknown, 5 - middle
+	int state = 0;
+	int index = 0;
+	char *match = begin;
+	SHL_RING_ITERATE(ring, val, vecs, size, pos) {
+		if (val == '\0')
+			continue;
+
+		switch (state) {
+		case 0:
+			if (match[index] != val) {
+				if (start)
+					state = 5;
+				else
+					return -EINVAL;
+			}
+
+			if (++index == strlen(match))
+				state = 1;
+			break;
+		case 1:
+			if (val == ' ') {
+				if (start && time[1] != time[0])
+					state = 5;
+				else
+					state = 2;
+				break;
+			}
+			if (val < '0' || val > '9') {
+				if (start)
+					state = 5;
+				else
+					return -EINVAL;
+			}
+			time[guard] *= 10;
+			time[guard] += val - '0';
+			break;
+		case 2:
+			if (val == ' ') {
+				if (start && cmd[1] != cmd[0])
+					state = 5;
+				else
+					state = 3;
+				break;
+			}
+			if (val < '0' || val > '9') {
+				if (start)
+					state = 5;
+				else
+					return -EINVAL;
+			}
+			cmd[guard] *= 10;
+			cmd[guard] += val - '0';
+			break;
+		case 3:
+			if (val == '\n') {
+				if (!start) {
+					guard = 1;
+					index = 0;
+					state = 4;
+					start = pos + 1;
+				} else if (flags[1] != flags[0]) {
+					index = 0;
+					state = 4;
+				} else {
+					wlogs(DEBUG, "process_cmd_begin: Processed "
+					             "command: \"");
+					for (int i = start; i < start + len; ++i) {
+						if (i < vecs[0].iov_len)
+							wlogm(DEBUG, "%c",
+							      ((char *)vecs[0].iov_base)[i]);
+						else
+							wlogm(DEBUG, "%c", ((char *)vecs[1].iov_base)
+							                   [i - vecs[0].iov_len]);
+					}
+					wlogm(DEBUG, "\"");
+					wloge(DEBUG);
+
+					int r = 0;
+					if (cc->cmd_cb)
+						r = cc->cmd_cb(cc, start, len, match == error);
+					shl_ring_pop(ring, pos + 1);
+					return r < 0 ? r : pos + 1;
+				}
+				break;
+			}
+			if (val < '0' || val > '9') {
+				if (start)
+					state = 5;
+				else
+					return -EINVAL;
+			}
+			flags[guard] *= 10;
+			flags[guard] += val - '0';
+			break;
+		case 4:
+			if (val == end[index] && val == error[index]) {
+				++index;
+				break;
+			} else if (val == end[index]) {
+				match = end;
+				state = 0;
+				++index;
+				break;
+			} else if (val == error[index]) {
+				match = error;
+				state = 0;
+				++index;
+				break;
+			} else {
+				state = 5;
+			}
+			// Intentionally no "break" here.
+		case 5:
+			if (val == '\n') {
+				len = pos + 1 - start;
+				state = 4;
+				index = 0;
+			}
+			break;
+		}
+	}
+
+	return 0;
 }
 
 int wtc_tmux_cc_process_output(struct wtc_tmux_cc *cc)

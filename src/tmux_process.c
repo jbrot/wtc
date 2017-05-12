@@ -39,6 +39,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <unistd.h>
 #include <wayland-server-core.h>
 #include <wait.h>
@@ -151,6 +152,10 @@ int wtc_tmux_cc_launch(struct wtc_tmux *tmux, struct wtc_tmux_session *sess)
 	cc->pid = pid;
 	cc->temp = false;
 	cc->fin = fin;
+	cc->fout = fout;
+
+	//char msg[] = "list-panes\n";
+	//write(fin, msg, strlen(msg));
 
 	cc->outs = wlc_event_loop_add_fd(fout, WL_EVENT_READABLE
 	                                     | WL_EVENT_HANGUP, cc_cb, cc);
@@ -371,6 +376,9 @@ int wtc_tmux_exec(struct wtc_tmux *tmux, const char *const *cmds,
 	if (!tmux || !cmds)
 		return -EINVAL;
 
+	if (tmux->ccs)
+		return wtc_tmux_cc_exec(tmux->ccs, cmds, out, err);
+
 	pout = out ? &fout : NULL;
 	perr = err ? &ferr : NULL;
 
@@ -420,6 +428,173 @@ err_fds:
 		}
 	}
 	return r ? r : status;
+}
+
+struct cb_dat {
+	bool handled;
+	char **out;
+	char **err;
+};
+
+static int exec_cc_cb(struct wtc_tmux_cc *cc, size_t start,
+                      size_t len, bool err)
+{
+	struct shl_ring *ring = &(cc->buf);
+	struct cb_dat *dat = cc->userdata;
+	char **out = err ? dat->err : dat->out;
+	if (!out) {
+		dat->handled = true;
+		return 0;
+	}
+
+	size_t i = 0;
+	if (*out) {
+		i = strlen(*out);
+		len += i;
+	}
+
+	struct iovec vecs[2];
+	size_t size, pos;
+	char val;
+
+	char *buf = calloc(len + 1, sizeof(char)); // + 1 for end '\0'
+	if (!buf) {
+		crit("exec_cc_cb: Couldn't allocate buffer!");
+		return -ENOMEM;
+	}
+
+	if (*out)
+		memcpy(buf, *out, i);
+
+	SHL_RING_ITERATE(ring, val, vecs, size, pos) {
+		if (pos < start) {
+			pos = start - 1;
+			continue;
+		}
+
+		if (pos == start + len)
+			break;
+
+		if (val == '\0')
+			continue;
+
+		buf[i++] = val;
+	}
+	buf[i] = '\0';
+
+	if (*out)
+		free(*out);
+	*out = buf;
+	dat->handled = true;
+
+	return 0;
+}
+
+int wtc_tmux_cc_exec(struct wtc_tmux_cc *cc, const char *const *cmds,
+                     char **out, char **err)
+{
+	int r = 0;
+
+	if (!cc)
+		return -EINVAL;
+
+	// First, encode the command into a string.
+	int len = 0;
+	char *buf;
+	for (int i = 0; cmds[i]; ++i) {
+		len += 3; // space quote ... quote
+		for (int j = 0; cmds[i][j] != '\0'; ++j) {
+			if (cmds[i][j] == '"')
+				len += 2; // \"
+			else if (cmds[i][j] == '\n')
+				len += 2; // \n
+			else
+				++len;
+		}
+	}
+
+	buf = calloc(len + 1, sizeof(char)); // For terminating \0
+	if (!buf) {
+		crit("tmux_cc_exec: Couldn't allocate buf!");
+		return -ENOMEM;
+	}
+
+	int pos = 0;
+	for (int i = 0; cmds[i]; ++i) {
+		if (i != 0)
+			buf[pos++] = ' ';
+		buf[pos++] = '"';
+		for (int j = 0; cmds[i][j] != '\0'; ++j) {
+			if (cmds[i][j] == '"') {
+				buf[pos++] = '\\';
+				buf[pos++] = '"';
+			} else if (cmds[i][j] == '\n') {
+				buf[pos++] = '\\';
+				buf[pos++] = 'n';
+			} else {
+				buf[pos++] = cmds[i][j];
+			}
+		}
+		buf[pos++] = '"';
+	}
+	buf[pos++] = '\n';
+	buf[pos++] = '\0';
+
+	debug("wtc_tmux_cc_exec: Command: %s", buf);
+
+	pos = 0;
+	while (r = write(cc->fin, buf + pos, len - pos)) {
+		if (r == -1) {
+			if (errno == EINTR)
+				continue;
+			warn("wtc_tmux_cc_exec: Error while writing: %d", errno);
+			r = -errno;
+			goto err_buf;
+		}
+
+		pos += r;
+		if (pos == len)
+			break;
+	}
+
+	void *ud_bak = cc->userdata;
+	int (*cmd_bak)(struct wtc_tmux_cc *, size_t, size_t, bool) = cc->cmd_cb;
+	struct cb_dat dat = { false, out, err};
+
+	cc->userdata = &dat;
+	cc->cmd_cb = exec_cc_cb;
+
+	struct pollfd pol = { .fd = cc->fout, .events = POLLIN, .revents = 0 };
+	uint32_t mask = 0;
+	// TODO timeout
+	while (r = poll(&pol, 1, 1000)) {
+		if (r == -1) {
+			if (errno == EINTR)
+				continue;
+			warn("wtc_tmux_cc_exec: Error waiting for results: %d", errno);
+			r = -errno;
+			goto err_poll;
+		}
+		mask = 0;
+		if (pol.revents & POLLIN)
+			mask |= WL_EVENT_READABLE;
+		if (pol.revents & POLLHUP)
+			mask |= WL_EVENT_HANGUP;
+		if (pol.revents & POLLERR)
+			mask |= WL_EVENT_ERROR;
+		r = cc_cb(pol.fd, mask, cc);
+		if (r < 0)
+			goto err_poll;
+		if (dat.handled)
+			break;
+	}
+
+err_poll:
+	cc->userdata = ud_bak;
+	cc->cmd_cb = cmd_bak;
+err_buf:
+	free(buf);
+	return r;
 }
 
 int wtc_tmux_get_option(struct wtc_tmux *tmux, const char *name,

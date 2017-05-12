@@ -74,7 +74,7 @@ for( (sz) = shl_ring_peek((r), (ivc)),                             \
      (i) = 0,                                                      \
      (vl) = (sz) ? ((char *) (ivc)[0].iov_base)[0] : (vl);         \
      (i) < (sz);                                                   \
-     ++i,                                                          \
+     ++(i),                                                        \
      (vl) = (i) >= (sz) ? (vl) : (i) < (ivc)[0].iov_len            \
             ? ((char *) (ivc)[0].iov_base)[(i)]                    \
             : ((char *) (ivc)[1].iov_base)[(i) - (ivc)[0].iov_len] )
