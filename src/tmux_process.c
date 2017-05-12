@@ -154,8 +154,12 @@ int wtc_tmux_cc_launch(struct wtc_tmux *tmux, struct wtc_tmux_session *sess)
 	cc->fin = fin;
 	cc->fout = fout;
 
-	//char msg[] = "list-panes\n";
-	//write(fin, msg, strlen(msg));
+	cc->compensate = true;
+	r = wtc_tmux_cc_update_size(cc);
+	if (r < 0) {
+		warn("wtc_tmux_cc_launch: Couldn't set size: %d", r);
+		goto err_pid;
+	}
 
 	cc->outs = wlc_event_loop_add_fd(fout, WL_EVENT_READABLE
 	                                     | WL_EVENT_HANGUP, cc_cb, cc);
@@ -188,6 +192,26 @@ err_pid:
 err_cc:
 	free(cc);
 err_cmd:
+	free(dyn);
+	return r;
+}
+
+int wtc_tmux_cc_update_size(struct wtc_tmux_cc *cc)
+{
+	const char *cmd[] = { "refresh-client", "-C", NULL, NULL };
+	char *dyn = NULL;
+	int r;
+
+	if (!cc || !cc->tmux)
+		return -EINVAL;
+
+	r = bprintf(&dyn, "%d,%d", cc->tmux->w, cc->tmux->h);
+	if (r < 0)
+		return r;
+	cmd[2] = dyn;
+
+	r = wtc_tmux_cc_exec(cc, cmd, NULL, NULL);
+
 	free(dyn);
 	return r;
 }
@@ -386,14 +410,17 @@ int wtc_tmux_exec(struct wtc_tmux *tmux, const char *const *cmds,
 	if (!pid)
 		return r;
 
-	// TODO Waitpid deal with EINTR
-	int status = 0;
-	if (waitpid(pid, &status, 0) != pid || r) {
-		if (!r)
-			warn("wtc_tmux_exec: waitpid error: %d", errno);
+	// TODO Set up timeout.
+	int status = 0, s = 0;
+	while (waitpid(pid, &status, 0) != pid) {
+		if (errno == EINTR)
+			continue;
+		warn("wtc_tmux_exec: waitpid error: %d", errno);
 		r = r ? r : -errno;
 		goto err_fds;
 	}
+	if (r)
+		goto err_fds;
 	if (!WIFEXITED(status)) {
 		warn("wtc_tmux_exec: Child didn't exit!");
 		r = -EINVAL;
@@ -442,6 +469,14 @@ static int exec_cc_cb(struct wtc_tmux_cc *cc, size_t start,
 	struct shl_ring *ring = &(cc->buf);
 	struct cb_dat *dat = cc->userdata;
 	char **out = err ? dat->err : dat->out;
+
+	// When starting a control client, there is a blank response at the
+	// beginning which we need to ignore.
+	if (cc->compensate) {
+		cc->compensate = false;
+		return 0;
+	}
+
 	if (!out) {
 		dat->handled = true;
 		return 0;
@@ -566,8 +601,7 @@ int wtc_tmux_cc_exec(struct wtc_tmux_cc *cc, const char *const *cmds,
 
 	struct pollfd pol = { .fd = cc->fout, .events = POLLIN, .revents = 0 };
 	uint32_t mask = 0;
-	// TODO timeout
-	while (r = poll(&pol, 1, 1000)) {
+	while (r = poll(&pol, 1, cc->tmux->timeout)) {
 		if (r == -1) {
 			if (errno == EINTR)
 				continue;

@@ -166,6 +166,7 @@ struct wtc_tmux_cc {
 	 * a command. This should probably not be used directly. Instead,
 	 * user wtc_tmux_cc_exec.
 	 */
+	bool compensate;
 	void *userdata;
 	int (*cmd_cb)(struct wtc_tmux_cc *cc, size_t st, size_t l, bool err);
 };
@@ -207,6 +208,11 @@ void wtc_tmux_cc_unref(struct wtc_tmux_cc *cc);
  * Launch a control client on the specified session.
  */
 int wtc_tmux_cc_launch(struct wtc_tmux *tmux, struct wtc_tmux_session *s);
+
+/*
+ * Adjust the size of the control client per the linked tmux's setting.
+ */
+int wtc_tmux_cc_update_size(struct wtc_tmux_cc *cc);
 
 /*
  * Fork a tmux process. cmds will be appended to tmux->cmds to produce the

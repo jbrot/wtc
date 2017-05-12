@@ -573,6 +573,9 @@ unsigned int wtc_tmux_get_timeout(const struct wtc_tmux *tmux)
 
 int wtc_tmux_set_size(struct wtc_tmux *tmux, unsigned int w, unsigned int h)
 {
+	struct wtc_tmux_cc *cc;
+	int r = 0;
+
 	if (!tmux || w < 10 || h < 10)
 		return -EINVAL;
 
@@ -586,7 +589,12 @@ int wtc_tmux_set_size(struct wtc_tmux *tmux, unsigned int w, unsigned int h)
 	if (!tmux->connected)
 		return 0;
 
-	// TODO change active clients' size.
+	for (cc = tmux->ccs; cc; cc = cc->next) {
+		r = wtc_tmux_cc_update_size(cc);
+		if (r < 0)
+			return r;
+	}
+
 	return 0;
 }
 
