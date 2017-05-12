@@ -162,30 +162,6 @@ void wtc_tmux_unref(struct wtc_tmux *tmux)
 	if (tmux->connected)
 		wtc_tmux_disconnect(tmux);
 
-	struct wtc_tmux_pane *pane, *tmpp;
-	HASH_ITER(hh, tmux->panes, pane, tmpp) {
-		HASH_DEL(tmux->panes, pane);
-		wtc_tmux_pane_free(pane);
-	}
-
-	struct wtc_tmux_window *window, *tmpw;
-	HASH_ITER(hh, tmux->windows, window, tmpw) {
-		HASH_DEL(tmux->windows, window);
-		wtc_tmux_window_free(window);
-	}
-
-	struct wtc_tmux_session *sess, *tmps;
-	HASH_ITER(hh, tmux->sessions, sess, tmps) {
-		HASH_DEL(tmux->sessions, sess);
-		wtc_tmux_session_free(sess);
-	}
-
-	struct wtc_tmux_client *client, *tmpc;
-	HASH_ITER(hh, tmux->clients, client, tmpc) {
-		HASH_DEL(tmux->clients, client);
-		wtc_tmux_client_free(client);
-	}
-
 	for (int i = 0; i < tmux->cmdlen; ++i)
 		if (cmd_freeable(tmux, tmux->cmd[i]))
 			free(tmux->cmd[i]);
@@ -530,12 +506,10 @@ err_rf:
 	return r;
 }
 
-int wtc_tmux_disconnect(struct wtc_tmux *tmux)
+void wtc_tmux_disconnect(struct wtc_tmux *tmux)
 {
-	if (!tmux)
-		return -EINVAL;
-	if (!tmux->connected)
-		return 0;
+	if (!tmux || !tmux->connected)
+		return;
 
 	sigaction(SIGCHLD, &tmux->restore, NULL);
 	memset(&tmux->restore, 0, sizeof(struct sigaction));
@@ -549,7 +523,47 @@ int wtc_tmux_disconnect(struct wtc_tmux *tmux)
 	tmux->rfev = NULL;
 	if (close(tmux->refreshfd))
 		warn("wtc_tmux_disconnect: Error closing refreshfd: %d", errno);
-	// TODO
+
+	int s;
+	struct wtc_tmux_cc *cc;
+	struct wtc_tmux_pane *pane, *tmpp;
+	struct wtc_tmux_window *window, *tmpw;
+	struct wtc_tmux_client *client, *tmpc;
+	struct wtc_tmux_session *sess, *tmps;
+;
+	for (cc = tmux->ccs; cc; cc = cc->next) {
+		// TODO kill more nicely?
+		kill(cc->pid, SIGKILL);
+		while ((s = waitpid(cc->pid, NULL, 0)) == -1 && errno == EINTR) ;
+		if (s == -1)
+			warn("wtc_tmux_disconnect: waitpid error for %d: %d",
+			     cc->pid, errno);
+
+		wtc_tmux_cc_unref(cc);
+	}
+	tmux->ccs = NULL;
+
+	HASH_ITER(hh, tmux->panes, pane, tmpp) {
+		HASH_DEL(tmux->panes, pane);
+		wtc_tmux_pane_free(pane);
+	}
+
+	HASH_ITER(hh, tmux->windows, window, tmpw) {
+		HASH_DEL(tmux->windows, window);
+		wtc_tmux_window_free(window);
+	}
+
+	HASH_ITER(hh, tmux->clients, client, tmpc) {
+		HASH_DEL(tmux->clients, client);
+		wtc_tmux_client_free(client);
+	}
+
+	HASH_ITER(hh, tmux->sessions, sess, tmps) {
+		HASH_DEL(tmux->sessions, sess);
+		wtc_tmux_session_free(sess);
+	}
+
+	tmux->connected = false;
 }
 
 bool wtc_tmux_is_connected(const struct wtc_tmux *tmux)

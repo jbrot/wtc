@@ -412,15 +412,13 @@ int wtc_tmux_exec(struct wtc_tmux *tmux, const char *const *cmds,
 
 	// TODO Set up timeout.
 	int status = 0, s = 0;
-	while (waitpid(pid, &status, 0) != pid) {
-		if (errno == EINTR)
-			continue;
-		warn("wtc_tmux_exec: waitpid error: %d", errno);
+	while ((s = waitpid(pid, &status, 0)) == -1 && errno == EINTR) ;
+	if (s == -1 || r) {
+		if (s == -1)
+			warn("wtc_tmux_exec: waitpid error: %d", errno);
 		r = r ? r : -errno;
 		goto err_fds;
 	}
-	if (r)
-		goto err_fds;
 	if (!WIFEXITED(status)) {
 		warn("wtc_tmux_exec: Child didn't exit!");
 		r = -EINVAL;

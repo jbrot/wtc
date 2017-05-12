@@ -304,7 +304,7 @@ const char *wtc_tmux_get_config_file(const struct wtc_tmux *tmux);
  * The original handler gets restored after calling wtc_tmux_disconnect.
  */
 int wtc_tmux_connect(struct wtc_tmux *tmux);
-int wtc_tmux_disconnect(struct wtc_tmux *tmux);
+void wtc_tmux_disconnect(struct wtc_tmux *tmux);
 bool wtc_tmux_is_connected(const struct wtc_tmux *tmux);
 
 /*
