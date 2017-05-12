@@ -39,6 +39,8 @@
 
 #include <signal.h>
 
+#define WTC_TMUX_TEMP_SESSION_NAME "__wtc_tmux_tmp"
+
 struct wtc_tmux_cc;
 
 /*
@@ -149,7 +151,7 @@ struct wtc_tmux_cc {
 	unsigned long ref;
 
 	struct wtc_tmux *tmux;
-	struct wtc_tmux_session *session;
+	struct wtc_tmux_session *session; // This may be NULL if temp is true
 
 	pid_t pid;
 	bool temp;

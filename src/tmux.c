@@ -109,7 +109,8 @@ static int sigc_cb(int fd, uint32_t mask, void *userdata)
 				tmux->ccs = cc->next;
 				if (cc->next)
 					cc->next->previous = NULL;
-				// TODO possible no session handler
+				else
+					wtc_tmux_queue_refresh(tmux, WTC_TMUX_REFRESH_SESSIONS);
 			}
 
 			wtc_tmux_cc_unref(cc);

@@ -761,8 +761,8 @@ int wtc_tmux_reload_sessions(struct wtc_tmux *tmux)
 {
 	int r = 0;
 	struct wtc_tmux_cb_closure cb;
-	const char *const cmd[] = { "list-sessions", "-F", "#{session_id}",
-	                            NULL };
+	const char *cmd[] = { "list-sessions", "-F",
+	                      "#{session_id} |#{session_name}", NULL };
 	char *out = NULL;
 	r = wtc_tmux_exec(tmux, cmd, &out, NULL);
 	if (r < 0) // We swallow non-zero exit to handle no server being up
@@ -770,7 +770,8 @@ int wtc_tmux_reload_sessions(struct wtc_tmux *tmux)
 
 	int count;
 	int *sids;
-	r = parselni("$%u%n", out, &count, &sids);
+	char **names;
+	r = parselnis("$%u |%n", out, &count, &sids, &names);
 	if (r < 0)
 		goto err_out;
 
@@ -810,6 +811,9 @@ int wtc_tmux_reload_sessions(struct wtc_tmux *tmux)
 		}
 		sess->id = sids[i];
 		HASH_ADD_INT(tmux->sessions, id, sess);
+
+		if (strcmp(names[i], WTC_TMUX_TEMP_SESSION_NAME) == 0)
+			continue;
 
 		cb.fid = WTC_TMUX_CB_NEW_SESSION;
 		cb.tmux = tmux;
@@ -868,8 +872,19 @@ int wtc_tmux_reload_sessions(struct wtc_tmux *tmux)
 		goto err_sids;
 
 	r = wtc_tmux_reload_clients(tmux);
+	if (r)
+		goto err_sids;
 
+	// If we have no sessions, start a temporary session. Otherwise, delete
+	// said temporary session if it exists.
+	if (!tmux->sessions)
+		r = wtc_tmux_cc_launch(tmux, NULL);
 err_sids:
+	if (names) {
+		for (int i = 0; i < count; ++i)
+			free(names[i]);
+	}
+	free(names);
 	free(sids);
 err_out:
 	free(out);
@@ -905,40 +920,45 @@ int wtc_tmux_refresh_cb(int fd, uint32_t mask, void *userdata)
 		return r;
 	}
 
-	if (tmux->refresh & WTC_TMUX_REFRESH_SESSIONS) {
+	// We make a copy so that when executing commands that might 
+	// inadvertantly change the value, we don't contaminate our list of
+	// things to refresh.
+	int refresh = tmux->refresh;
+	tmux->refresh = 0;
+
+	if (refresh & WTC_TMUX_REFRESH_SESSIONS) {
 		r = wtc_tmux_reload_sessions(tmux);
 		if (r < 0)
 			goto exit;
 
-		tmux->refresh = 0;
+		refresh = 0;
 	}
 
-	if (tmux->refresh & WTC_TMUX_REFRESH_WINDOWS) {
+	if (refresh & WTC_TMUX_REFRESH_WINDOWS) {
 		r = wtc_tmux_reload_windows(tmux);
 		if (r < 0)
 			goto exit;
 
-		tmux->refresh &= ~(WTC_TMUX_REFRESH_WINDOWS |
-		                   WTC_TMUX_REFRESH_PANES);
+		refresh &= ~(WTC_TMUX_REFRESH_WINDOWS | WTC_TMUX_REFRESH_PANES);
 	}
 
-	if (tmux->refresh & WTC_TMUX_REFRESH_PANES) {
+	if (refresh & WTC_TMUX_REFRESH_PANES) {
 		r = wtc_tmux_reload_panes(tmux);
 		if (r < 0)
 			goto exit;
 
-		tmux->refresh &= ~WTC_TMUX_REFRESH_PANES;
+		refresh &= ~WTC_TMUX_REFRESH_PANES;
 	}
 
-	if (tmux->refresh & WTC_TMUX_REFRESH_CLIENTS) {
+	if (refresh & WTC_TMUX_REFRESH_CLIENTS) {
 		r = wtc_tmux_reload_clients(tmux);
 		if (r < 0)
 			goto exit;
 
-		tmux->refresh &= ~WTC_TMUX_REFRESH_CLIENTS;
+		refresh &= ~WTC_TMUX_REFRESH_CLIENTS;
 	}
 
-	assert(tmux->refresh == 0);
+	assert(refresh == 0);
 
 	for (size_t i = 0; i < tmux->closure_size; ++i) {
 		r = wtc_tmux_closure_invoke(&(tmux->closures[i]));
@@ -949,6 +969,10 @@ int wtc_tmux_refresh_cb(int fd, uint32_t mask, void *userdata)
 	print_status(tmux);
 
 exit:
+	// If there's an error, ensure what we missed gets taken care of next
+	// time.
+	if (refresh)
+		tmux->refresh |= refresh;
 	wtc_tmux_clear_closures(tmux);
 	return r;
 }

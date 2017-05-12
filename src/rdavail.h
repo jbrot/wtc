@@ -170,14 +170,19 @@ int bprintf(char **out, const char *format, ...);
  * modified. However, lines are parsed from str via strtok_r, which means
  * that str will be modified during parsing. str will not be restored to
  * its original state, so if it is important that str is unchanged, make
- * a copy before calling one of these functions.
+ * a copy before calling one of these function.
  *
- * Example parselni fmt: "$%u%n"
+ * Parse an integer and a string. Note that the format should parse 
+ * everything up until the string and then the rest of the line will be 
+ * parsed as the string.
+ *
+ * Example parselnis fmt: "$%u %n"
  */
-int parselni(const char *fmt, char *str, int *olen, int **out);
+int parselnis(const char *fmt, char *str, int *olen, int **out,
+              char ***out2);
 
 /*
- * Parse three integers per line instead of one.
+ * Parse three integers per line.
  *
  * Example parselniii format: "$%u @%u %u%n"
  */
@@ -185,9 +190,9 @@ int parselniii(const char *fmt, char *str, int *olen, int **out,
                int **out2, int **out3);
 
 /*
- * Parse two integers and a string per line instead of one. Note that the
- * format should parse everything up until the string and then the rest of
- * the line will be parsed as the string.
+ * Parse two integers and a string per line. Note that the format should 
+ * parse everything up until the string and then the rest of the line will 
+ * be parsed as the string.
  *
  * Example parselniis format: "$%u @%u %n"
  */

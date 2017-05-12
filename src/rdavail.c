@@ -226,45 +226,74 @@ int bprintf(char **out, const char *format, ...)
 	return 0;
 }
 
-int parselni(const char *fmt, char *str, int *olen, int **out)
+int parselnis(const char *fmt, char *str, int *olen,
+              int **out, char ***out2)
 {
 	int r = 0;
 
-	if (!fmt || !str || !out || !olen)
+	if (!fmt || !str || !olen || !out || !out2)
 		return -EINVAL;
 
-	// First, we estimate with number of lines (this over counts in the
-	// empty case).
-	int count = 0;
-	for (int i = 0; str[i]; ++i)
-		count += str[i] == '\n';
+	int count = 0, lc = 0, mxl = 0;
+	for (int i = 0; str[i]; ++i) {
+		if (str[i] == '\n') {
+			count++;
+			lc = 0;
+		} else {
+			mxl = mxl > ++lc ? mxl : lc;
+		}
+	}
+	mxl++; // For '\0'
 
 	int *is = calloc(count, sizeof(int));
 	if (!is) {
-		crit("parselni: couldn't allocate is!");
+		crit("parselnis: Couldn't allocate is!");
 		return -ENOMEM;
 	}
 
-	count = 0;
+	char **ss = calloc(count, sizeof(char *));
+	if (!ss) {
+		crit("parselnis: Couldn't allocate ss!");
+		r = -ENOMEM;
+		goto err_is;
+	}
+	for (int i = 0; i < count; ++i) {
+		ss[i] = calloc(mxl, sizeof(char));
+		if (!ss[i])
+			goto err_ss;
+	}
+
+	int ncount = 0;
 	char *svptr = NULL;
 	char *pos = strtok_r(str, "\n", &svptr);
 	int linec = 0;
 	while (pos != NULL) {
-		r = sscanf(pos, fmt, &is[count], &linec);
-		if (r != 1 || linec != strlen(pos)) {
-			warn("parselni: Parse error!");
+		r = sscanf(pos, fmt, &is[ncount], &linec);
+		if (r != 1) {
+			warn("parselnis: Parse error!");
 			r = -EINVAL;
-			goto err_is;
+			goto err_ss;
 		}
+		strcpy(ss[ncount], pos + linec);
 
-		count++;
+		ncount++;
 		pos = strtok_r(NULL, "\n", &svptr);
 	}
 
+	for (int i = ncount; i < count; ++i)
+		free(ss[i]);
+
+	*olen = ncount;
 	*out = is;
-	*olen = count;
+	*out2 = ss;
 	return 0;
 
+err_ss:
+	if (ss) {
+		for (int i = 0; i < count; ++i)
+			free(ss[i]);
+	}
+	free(ss);
 err_is:
 	free(is);
 	return r;

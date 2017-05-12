@@ -126,13 +126,20 @@ int wtc_tmux_cc_launch(struct wtc_tmux *tmux, struct wtc_tmux_session *sess)
 	pid_t pid = 0;
 	int r = 0, s = 0;
 
-	if (!tmux || !sess) // TODO Launch new session here if sess is NULL?
+	if (!tmux)
 		return -EINVAL;
 
-	r = bprintf(&dyn, "$%u", sess->id);
-	if (r < 0)
-		return r;
-	cmd[3] = dyn;
+	if (!sess) {
+		cmd[1] = "new-session";
+		cmd[2] = "-s";
+		cmd[3] = WTC_TMUX_TEMP_SESSION_NAME;
+		cmd[4] = NULL;
+	} else {
+		r = bprintf(&dyn, "$%u", sess->id);
+		if (r < 0)
+			return r;
+		cmd[3] = dyn;
+	}
 
 	cc = calloc(1, sizeof(struct wtc_tmux_cc));
 	if (!cc) {
@@ -150,7 +157,7 @@ int wtc_tmux_cc_launch(struct wtc_tmux *tmux, struct wtc_tmux_session *sess)
 	cc->session = sess;
 
 	cc->pid = pid;
-	cc->temp = false;
+	cc->temp = !sess;
 	cc->fin = fin;
 	cc->fout = fout;
 
@@ -169,7 +176,20 @@ int wtc_tmux_cc_launch(struct wtc_tmux *tmux, struct wtc_tmux_session *sess)
 	}
 
 	if (tmux->ccs) {
-		for (tmp = tmux->ccs; tmp->next; tmp = tmp->next) ;
+		tmp = tmux->ccs;
+		while (true) {
+			if (tmp->temp) {
+				cmd[0] = "kill-session";
+				cmd[1] = NULL;
+				int s = wtc_tmux_cc_exec(tmp, cmd, NULL, NULL);
+				if (s)
+					warn("wtc_tmux_cc_launch: Error closing temp "
+					     "session: %d", s);
+			}
+
+			if (!tmp->next)
+				break;
+		}
 		tmp->next = cc;
 		cc->previous = tmp;
 	} else {
@@ -400,8 +420,12 @@ int wtc_tmux_exec(struct wtc_tmux *tmux, const char *const *cmds,
 	if (!tmux || !cmds)
 		return -EINVAL;
 
-	if (tmux->ccs)
-		return wtc_tmux_cc_exec(tmux->ccs, cmds, out, err);
+	if (tmux->ccs) {
+		struct wtc_tmux_cc *cc;
+		for (cc = tmux->ccs; cc && cc->temp; cc = cc->next) ;
+		if (cc)
+			return wtc_tmux_cc_exec(cc, cmds, out, err);
+	}
 
 	pout = out ? &fout : NULL;
 	perr = err ? &ferr : NULL;
@@ -605,10 +629,8 @@ int wtc_tmux_cc_exec(struct wtc_tmux_cc *cc, const char *const *cmds,
 		mask = 0;
 		if (pol.revents & POLLIN)
 			mask |= WL_EVENT_READABLE;
-		if (pol.revents & POLLHUP)
-			mask |= WL_EVENT_HANGUP;
-		if (pol.revents & POLLERR)
-			mask |= WL_EVENT_ERROR;
+		if (pol.revents & (POLLHUP | POLLERR))
+			goto err_poll;
 		r = cc_cb(pol.fd, mask, cc);
 		if (r < 0)
 			goto err_poll;
