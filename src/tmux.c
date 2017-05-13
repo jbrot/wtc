@@ -28,7 +28,7 @@
 #include "tmux_internal.h"
 
 #include "log.h"
-#include "rdavail.h"
+#include "util.h"
 
 #include <assert.h>
 #include <errno.h>

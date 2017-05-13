@@ -35,7 +35,7 @@
 #include "tmux_internal.h"
 
 #include "log.h"
-#include "rdavail.h"
+#include "util.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -168,10 +168,10 @@ int wtc_tmux_cc_launch(struct wtc_tmux *tmux, struct wtc_tmux_session *sess)
 		goto err_pid;
 	}
 
-	cc->outs = wlc_event_loop_add_fd(fout, WL_EVENT_READABLE
-	                                     | WL_EVENT_HANGUP, cc_cb, cc);
+	cc->outs = wlc_event_loop_add_fd(fout, WL_EVENT_READABLE, cc_cb, cc);
 	if (!cc->outs) {
 		warn("wtc_tmux_cc_launch: Couldn't add fout to event loop!");
+		r = -1;
 		goto err_pid;
 	}
 
@@ -274,136 +274,8 @@ int wtc_tmux_fork(struct wtc_tmux *tmux, const char *const *cmds,
 		}
 	}
 
-	int pin[2];
-	int pout[2];
-	int perr[2];
-	if (fin) {
-		r = pipe2(pin, O_CLOEXEC);
-		if (r < 0) {
-			warn("wtc_tmux_fork: Couldn't open fin: %d", errno);
-			r = -errno;
-			goto err_exc;
-		}
-	}
-	if (fout) {
-		r = pipe2(pout, O_CLOEXEC);
-		if (r < 0) {
-			warn("wtc_tmux_fork: Couldn't open fout: %d", errno);
-			r = -errno;
-			goto err_pin;
-		}
-		r = fcntl(pout[0], F_GETFL);
-		if (r < 0) {
-			warn("wtc_tmux_fork: Can't get fout flags: %d", errno);
-			r = -errno;
-			goto err_pout;
-		}
-		r = fcntl(pout[0], F_SETFL, r | O_NONBLOCK);
-		if (r < 0) {
-			warn("wtc_tmux_fork: Can't set fout O_NONBLOCK: %d", errno);
-			r = -errno;
-			goto err_pout;
-		}
-	}
-	if (ferr) {
-		r = pipe2(perr, O_CLOEXEC);
-		if (r < 0) {
-			warn("wtc_tmux_fork: Couldn't open ferr: %d", errno);
-			r = -errno;
-			goto err_pout;
-		}
-		r = fcntl(perr[0], F_GETFL);
-		if (r < 0) {
-			warn("wtc_tmux_fork: Can't get ferr flags: %d", errno);
-			r = -errno;
-			goto err_perr;
-		}
-		r = fcntl(perr[0], F_SETFL, r | O_NONBLOCK);
-		if (r < 0) {
-			warn("wtc_tmux_fork: Can't set ferr O_NONBLOCK: %d", errno);
-			r = -errno;
-			goto err_perr;
-		}
-	}
+	return fork_exec(exc, pid, fin, fout, ferr);
 
-	wlogs(DEBUG, "wtc_tmux_fork: Forking: ");
-	for (int i = 0; exc[i]; ++i) wlogm(DEBUG, "%s ", exc[i]);
-	wloge(DEBUG);
-
-	pid_t cpid = fork();
-	if (cpid == -1) {
-		warn("wtc_tmux_fork: Couldn't fork: %d", errno);
-		r = -errno;
-		goto err_perr;
-	} else if (cpid == 0) { // Child
-		r = 0;
-
-		if (fin)
-			while ((r = dup2(pin[0],  STDIN_FILENO)) == -1 &&
-			       errno == EINTR) ;
-		if (fout && r != -1)
-			while ((r = dup2(pout[1], STDOUT_FILENO)) == -1 &&
-			       errno == EINTR) ;
-		if (ferr && r != -1)
-			while ((r = dup2(perr[1], STDERR_FILENO)) == -1 &&
-			       errno == EINTR) ;
-		if (r == -1) {
-			crit("Could not change stdio file descriptors: %d", errno);
-			_exit(errno);
-		}
-
-		execv(exc[0], exc);
-		crit("Exec failed: %d", errno);
-		_exit(errno); // Exec failed
-	}
-
-	// Parent
-	if (pid)
-		*pid = cpid;
-
-	if (fin)
-		*fin = pin[1];
-	if (fout)
-		*fout = pout[0];
-	if (ferr)
-		*ferr = perr[0];
-
-	if(fin && close(pin[0]) == -1 && errno != EINTR) {
-		warn("wtc_tmux_fork: Couldn't close fin: %d", errno);
-		r = -errno;
-	}
-	if(fout && close(pout[1]) == -1 && errno != EINTR) {
-		warn("wtc_tmux_fork: Couldn't close fout: %d", errno);
-		r = r ? r : -errno;
-	}
-	if(ferr && close(perr[1]) == -1 && errno != EINTR) {
-		warn("wtc_tmux_fork: Couldn't close ferr: %d", errno);
-		r = r ? r : -errno;
-	}
-
-	return r;
-
-err_perr:
-	if (ferr) {
-		if (close(perr[0]))
-			warn("wtc_tmux_fork: Couldn't close perr0: %d", errno);
-		if (close(perr[1]))
-			warn("wtc_tmux_fork: Couldn't close perr1: %d", errno);
-	}
-err_pout:
-	if (fout) {
-		if (close(pout[0]))
-			warn("wtc_tmux_fork: Couldn't close pout0: %d", errno);
-		if (close(pout[1]))
-			warn("wtc_tmux_fork: Couldn't close pout1: %d", errno);
-	}
-err_pin:
-	if (fin) {
-		if (close(pin[0]))
-			warn("wtc_tmux_fork: Couldn't close pin0: %d", errno);
-		if (close(pin[1]))
-			warn("wtc_tmux_fork: Couldn't close pin1: %d", errno);
-	}
 err_exc:
 	for (int i = 0; i < len; ++i)
 		free(exc[i]);
@@ -631,8 +503,14 @@ int wtc_tmux_cc_exec(struct wtc_tmux_cc *cc, const char *const *cmds,
 		mask = 0;
 		if (pol.revents & POLLIN)
 			mask |= WL_EVENT_READABLE;
-		if (pol.revents & (POLLHUP | POLLERR))
+		if (pol.revents & (POLLHUP | POLLERR)) {
+			if (pol.revents & POLLHUP)
+				debug("wtc-tmux_cc_exec: HUP!");
+			if (pol.revents & POLLERR)
+				debug("wtc-tmux_cc_exec: Error!");
+			r = -EIO;
 			goto err_poll;
+		}
 		r = cc_cb(pol.fd, mask, cc);
 		if (r < 0)
 			goto err_poll;

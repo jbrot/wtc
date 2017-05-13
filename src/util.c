@@ -1,5 +1,5 @@
 /*
- * wtc - rdavail.c
+ * wtc - util.c
  *
  * Copyright (c) 2017 Joshua Brot <jbrot@umich.edu>
  *
@@ -23,12 +23,15 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#include "rdavail.h"
+#define _GNU_SOURCE
+
+#include "util.h"
 
 #include "log.h"
 #include "shl_ring.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -484,4 +487,149 @@ char *strtokd(char *str, const char *delim, char **saveptr, char *fdelim)
 
 out:
 	return startptr;
+}
+
+
+int fork_exec(char *const *cmd, pid_t *pid, int *fin, 
+              int *fout, int *ferr)
+{
+	int r = 0;
+
+	if (!cmd)
+		return -EINVAL;
+
+	int pin[2];
+	int pout[2];
+	int perr[2];
+	if (fin) {
+		r = pipe2(pin, O_CLOEXEC);
+		if (r < 0) {
+			warn("fork_exec: Couldn't open fin: %d", errno);
+			return -errno;
+		}
+	}
+	if (fout) {
+		r = pipe2(pout, O_CLOEXEC);
+		if (r < 0) {
+			warn("fork_exec: Couldn't open fout: %d", errno);
+			r = -errno;
+			goto err_pin;
+		}
+		r = fcntl(pout[0], F_GETFL);
+		if (r < 0) {
+			warn("fork_exec: Can't get fout flags: %d", errno);
+			r = -errno;
+			goto err_pout;
+		}
+		r = fcntl(pout[0], F_SETFL, r | O_NONBLOCK);
+		if (r < 0) {
+			warn("fork_exec: Can't set fout O_NONBLOCK: %d", errno);
+			r = -errno;
+			goto err_pout;
+		}
+	}
+	if (ferr) {
+		r = pipe2(perr, O_CLOEXEC);
+		if (r < 0) {
+			warn("fork_exec: Couldn't open ferr: %d", errno);
+			r = -errno;
+			goto err_pout;
+		}
+		r = fcntl(perr[0], F_GETFL);
+		if (r < 0) {
+			warn("fork_exec: Can't get ferr flags: %d", errno);
+			r = -errno;
+			goto err_perr;
+		}
+		r = fcntl(perr[0], F_SETFL, r | O_NONBLOCK);
+		if (r < 0) {
+			warn("fork_exec: Can't set ferr O_NONBLOCK: %d", errno);
+			r = -errno;
+			goto err_perr;
+		}
+	}
+
+	wlogs(DEBUG, "fork_exec: Forking: ");
+	for (int i = 0; cmd[i]; ++i) wlogm(DEBUG, "%s ", cmd[i]);
+	wloge(DEBUG);
+
+	pid_t cpid = fork();
+	if (cpid == -1) {
+		warn("fork_exec: Couldn't fork: %d", errno);
+		r = -errno;
+		goto err_perr;
+	} else if (cpid == 0) { // Child
+		r = 0;
+
+		if (fin)
+			while ((r = dup2(pin[0],  STDIN_FILENO)) == -1 &&
+			       errno == EINTR) ;
+		if (fout && r != -1)
+			while ((r = dup2(pout[1], STDOUT_FILENO)) == -1 &&
+			       errno == EINTR) ;
+		else if (r != -1 && !freopen("/dev/null", "w", stdout))
+			r = -1;
+		if (ferr && r != -1)
+			while ((r = dup2(perr[1], STDERR_FILENO)) == -1 &&
+			       errno == EINTR) ;
+		else if (r != -1 && !freopen("/dev/null", "w", stderr))
+			r = -1;
+		if (r == -1) {
+			crit("Could not change stdio file descriptors: %d", errno);
+			_exit(errno);
+		}
+
+		execv(cmd[0], cmd);
+		crit("Exec failed: %d", errno);
+		_exit(errno); // Exec failed
+	}
+
+	// Parent
+	if (pid)
+		*pid = cpid;
+
+	if (fin)
+		*fin = pin[1];
+	if (fout)
+		*fout = pout[0];
+	if (ferr)
+		*ferr = perr[0];
+
+	if(fin && close(pin[0]) == -1 && errno != EINTR) {
+		warn("fork_exec: Couldn't close fin: %d", errno);
+		r = -errno;
+	}
+	if(fout && close(pout[1]) == -1 && errno != EINTR) {
+		warn("fork_exec: Couldn't close fout: %d", errno);
+		r = r ? r : -errno;
+	}
+	if(ferr && close(perr[1]) == -1 && errno != EINTR) {
+		warn("fork_exec: Couldn't close ferr: %d", errno);
+		r = r ? r : -errno;
+	}
+
+	return r;
+
+err_perr:
+	if (ferr) {
+		if (close(perr[0]))
+			warn("fork_exec: Couldn't close perr0: %d", errno);
+		if (close(perr[1]))
+			warn("fork_exec: Couldn't close perr1: %d", errno);
+	}
+err_pout:
+	if (fout) {
+		if (close(pout[0]))
+			warn("fork_exec: Couldn't close pout0: %d", errno);
+		if (close(pout[1]))
+			warn("fork_exec: Couldn't close pout1: %d", errno);
+	}
+err_pin:
+	if (fin) {
+		if (close(pin[0]))
+			warn("fork_exec: Couldn't close pin0: %d", errno);
+		if (close(pin[1]))
+			warn("fork_exec: Couldn't close pin1: %d", errno);
+	}
+	return r;
 }

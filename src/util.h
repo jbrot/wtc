@@ -1,5 +1,5 @@
 /*
- * wtc - rdavail.h
+ * wtc - util.h
  *
  * Copyright (c) 2017 Joshua Brot <jbrot@umich.edu>
  *
@@ -30,6 +30,8 @@
 
 #ifndef WTC_RDAVL_H
 #define WTC_RDAVL_H
+
+#include <sys/types.h>
 
 /*
  *   int read_available(int fd, int mode, int *size, void *out)
@@ -207,5 +209,18 @@ int parselniis(const char *fmt, char *str, int *olen, int **out,
  * the changed token will not be stored)
  */
 char *strtokd(char *str, const char *delim, char **saveptr, char *fdelim);
+
+/*
+ * Fork and exec cmds. The resulting process' id will be put in pid.
+ * If fin, fout, or ferr are not NULL, then they will be set to a file
+ * descriptor which is the end of a pipe to stdin, stdout, and stderr of the
+ * child process respectively.
+ *
+ * Returns 0 on success and a negative value if an error occurs. However, if
+ * the error occurs after forking (i.e., when closing the child half of the
+ * pipes), then pid, fin, fout, and ferr will be properly populated.
+ */
+int fork_exec(char *const *cmds, pid_t *pid, int *fin, 
+              int *fout, int *ferr);
 
 #endif // !WTC_RDAVL_H
