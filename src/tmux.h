@@ -38,6 +38,10 @@
  * NOTE: The SIGCHLD handler gets replaced with an internal handler once 
  * wtc_tmux_connect succeeds. The original handler gets restored once 
  * wtc_tmux_disconnect gets called.
+ *
+ * WARNING: I've done my best to avoid producing SIGPIPE. However, this is
+ * not always possible. It is highly recommended that you block SIGPIPE when
+ * using this interface.
  */
 
 #ifndef WTC_TMUX_H

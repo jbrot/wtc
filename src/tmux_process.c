@@ -189,6 +189,8 @@ int wtc_tmux_cc_launch(struct wtc_tmux *tmux, struct wtc_tmux_session *sess)
 
 			if (!tmp->next)
 				break;
+
+			tmp = tmp->next;
 		}
 		tmp->next = cc;
 		cc->previous = tmp;
