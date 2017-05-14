@@ -29,6 +29,7 @@
 #include "util.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,6 +48,13 @@ struct wtc_output {
 
 	// Position and size of top left gridsquare of the terminal
 	int term_x, term_y, term_w, term_h;
+
+	struct wtc_tmux_client *client;
+};
+
+struct wtc_view {
+	pid_t pane_pid;
+	struct wtc_tmux_pane *pane;
 };
 
 static void wlc_log(enum wlc_log_type type, const char *str)
@@ -64,6 +72,39 @@ static void wlc_log(enum wlc_log_type type, const char *str)
 	case  WLC_LOG_WAYLAND:
 		info("[wayland] %s", str);
 	}
+}
+
+
+static const struct wtc_tmux_client *get_client(wlc_handle output)
+{
+	struct wtc_output *ud = wlc_handle_get_user_data(output);
+	if (!ud)
+		return NULL;
+	if (ud->client)
+		return ud->client;
+
+	// Now search through the available clients for ours.
+	const struct wtc_tmux_session *sess = wtc_tmux_root_session(tmux);
+	const struct wtc_tmux_client *client;
+	pid_t pid = 0;
+	for ( ; sess; sess = sess->hh.next) {
+		for (client = sess->clients; client; client = client->next) {
+			pid = client->pid;
+			do {
+				if (pid == ud->term_pid) {
+					info("get_client: Identified client: %s!",
+					     client->name);
+					return client;
+				}
+				if (get_parent_pid(pid, &pid))
+					return NULL;
+			} while (pid > 0);
+		}
+	}
+
+	warn("get_client: Couldn't find client!");
+
+	return NULL;
 }
 
 // Hacky debug function.
@@ -230,22 +271,17 @@ err_pid:
 
 bool wlc_view_cr(wlc_handle view)
 {
+	debug("wlc_view_cr");
 	// First check if this is a terminal and handle appropriately.
 	pid_t pid = wlc_view_get_pid(view);
-	wlc_handle vop = 0;
+	wlc_handle vop = wlc_view_get_output(view);
 
-	size_t count;
-	const wlc_handle *outputs = wlc_get_outputs(&count);
-	bool found = false;
-	for (int i = 0; i < count; ++i)
-	{
-		struct wtc_output *ud = wlc_handle_get_user_data(outputs[i]);
-		if (!ud || ud->term_pid != pid)
-			continue;
+	if (!vop)
+		return false;
 
+	struct wtc_output *ud = wlc_handle_get_user_data(vop);
+	if (ud && ud->term_pid == pid) {
 		ud->term_view = view;
-		vop = outputs[i];
-		found = true;
 
 		const struct wlc_geometry g = {
 			.origin = {
@@ -256,18 +292,54 @@ bool wlc_view_cr(wlc_handle view)
 		};
 
 		wlc_view_set_geometry(view, 0, &g);
-		break;
+		wlc_view_set_mask(view, wlc_output_get_mask(vop));
+		wlc_view_focus(view);
+	} else {
+		const char *cmd[] = { "split-window", "-t", NULL, "-F",
+		                      "#{pane_pid}", NULL, NULL };
+		const struct wtc_tmux_client *client;
+		char *dpane = NULL, *dcmd = NULL;
+		char *out = NULL;
+
+		client = get_client(vop);
+		if (!client)
+			return false;
+		if (bprintf(&dpane, "%%%d",
+		            client->session->active_window->active_pane->id))
+			return false;
+		if (bprintf(&dcmd, "echo \"PID: %u\"; sleep infinity", pid)) {
+			free(dpane);
+			return false;
+		}
+
+		cmd[2] = dpane;
+		cmd[5] = dcmd;
+
+		wtc_tmux_exec(tmux, cmd, &out, NULL);
+		if (!out) {
+			free(dcmd);
+			free(dpane);
+			return false;
+		}
+
+		struct wtc_view *vud = calloc(1, sizeof(struct wtc_view));
+		if (!vud) {
+			crit("wlc_view_cr: Couldn't allocate view user data!");
+			free(out);
+			free(dcmd);
+			free(dpane);
+			return false;
+		}
+		vud->pane_pid = atoi(out);
+		wlc_handle_set_user_data(view, vud);
+
+		wlc_view_set_mask(view, 0);
+
+		free(out);
+		free(dcmd);
+		free(dpane);
 	}
 
-	if (!found)
-		vop = wlc_view_get_output(view);
-
-	if (!vop)
-		return false;
-
-	wlc_view_set_output(view, vop);
-	wlc_view_set_mask(view, wlc_output_get_mask(vop));
-	wlc_view_focus(view);
 	debug("New view: %p -- %p -- %d -- %d\n", view, vop, wlc_output_get_mask(vop), wlc_view_get_state(view));
 
 	return true;
@@ -313,12 +385,11 @@ bool wlc_out_cr(wlc_handle output)
 	debug("New output: %p -- %s -- %p\n", output, wlc_output_get_name(output), wlc_handle_get_user_data(output));
 
 	if (wlc_handle_get_user_data(output) == NULL) {
-		ud = malloc(sizeof(struct wtc_output));
+		ud = calloc(1, sizeof(struct wtc_output));
 		if (!ud) {
 			crit("Could not allocate output data!");
 			return false;
 		}
-		memset(ud, 0, sizeof(struct wtc_output));
 		wlc_handle_set_user_data(output, ud);
 
 	} else {

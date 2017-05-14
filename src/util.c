@@ -633,3 +633,51 @@ err_pin:
 	}
 	return r;
 }
+
+int get_parent_pid(pid_t pid, pid_t *out)
+{
+	char *path = NULL;
+	char *stat = NULL, *offset;
+	int fd;
+	int r = 0;
+
+	if (!out)
+		return -EINVAL;
+
+	r = bprintf(&path, "/proc/%u/stat", pid);
+	if (r)
+		return r;
+
+	while ((fd = open(path, O_RDONLY)) == -1 && errno == -EINTR) ;;
+	if (fd == -1) {
+		warn("get_parent: Error opening stat file: %d", errno);
+		r = -errno;
+		goto err_path;
+	}
+
+	r = read_available(fd, WTC_RDAVL_CSTRING, NULL, &stat); 
+	if (r < 0)
+		goto err_fd;
+
+	offset = strrchr(stat, ')');
+	if (!offset) {
+		crit("get_parent: stat file of pid %d has invalid format!", pid);
+		r = -EINVAL;
+		goto err_fd;
+	}
+
+	r = sscanf(offset, ") %*c %d", out);
+	if (--r != 0) {
+		crit("get_parent: stat file of pid %d has invalid format!", pid);
+		r = -EINVAL;
+	}
+
+err_fd:
+	if (close(fd)) {
+		warn("get_parent: Error closing stat file: %d", errno);
+		r = r ? r : -errno;
+	}
+err_path:
+	free(path);
+	return r;
+}

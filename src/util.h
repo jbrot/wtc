@@ -223,4 +223,16 @@ char *strtokd(char *str, const char *delim, char **saveptr, char *fdelim);
 int fork_exec(char *const *cmds, pid_t *pid, int *fin, 
               int *fout, int *ferr);
 
+/*
+ * Find the parent pid of the process with the specified pid by parsing the
+ * file /proc/<pid>/stat.  The parent pid will be stored in out. Returns 0 
+ * on sucess and a negative value if an error occurs. Note that if an error
+ * occurs when closing the file descriptor, an error will be reported but
+ * the pid will still be stored in out.
+ *
+ * Note: This function assumes the user has procfs mounted at /proc. This is
+ * almost always a good assumption.
+ */
+int get_parent_pid(pid_t pid, pid_t *out);
+
 #endif // !WTC_RDAVL_H

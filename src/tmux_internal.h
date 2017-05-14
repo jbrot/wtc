@@ -241,35 +241,6 @@ int wtc_tmux_fork(struct wtc_tmux *tmux, const char *const *cmds,
                   pid_t *pid, int *fin, int *fout, int *ferr);
 
 /*
- * Run the command specified in cmds, wait for it to finish, and store its
- * stdout in out and stderr in err. Out and err may be NULL to indicate the
- * respective streams should be ignored. Out and err will be populated using
- * read_available with mode WTC_RDAVL_CSTRING | WTC_RDAVL_BUF. Thus, if *out
- * or *err are not NULL, then they are expected to point to an existing 
- * c string. On success the newly read data will be appended to the existing
- * data.
- *
- * Returns the client exit status (non-negative) or a negative value on
- * failure. Note that failures during closing the fds will not be reported
- * if an earlier failure occured (and likewise an error closing the first
- * fd hides any error closing the second). If an error occurs after the
- * client exits, the negative error code will be reported instead of the
- * client exit status. Furthermore, output may be stored in *out, *err, or
- * both even if a negative exit status is returned depending on where the
- * error occurs. However, there is a guarantee that if *out or *err have
- * their values changed, then the new value points to the complete output
- * on that stream and no errors were detected while processing it.
- *
- * NOTE: If there exists an active control session, this calls
- * wtc_tmux_cc_exec instead of launching a new process. If your command
- * isn't explicit about which session/window/client/pane it is targeting
- * this may have unwanted side effecs. Furthermore, this will prevent
- * the version checking from working.
- */
-int wtc_tmux_exec(struct wtc_tmux *tmux, const char *const *cmds,
-                  char **out, char **err);
-
-/*
  * Functionally equivalent to wtc_tmux_exec. However, instead of forking
  * a new tmux instance, the command is run on the specified wtc_tmux_cc.
  */
