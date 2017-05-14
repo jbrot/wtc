@@ -77,6 +77,10 @@ struct wtc_tmux_pane
 	 * will be active in a window.
 	 */
 	bool active;
+	/*
+	 * Whether or not this pane is in a mode (e.g., copy mode).
+	 */
+	bool in_mode;
 
 	/* The window which includes this pane. */
 	struct wtc_tmux_window *window;

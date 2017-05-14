@@ -524,7 +524,7 @@ static void reposition_view(wlc_handle view)
 		return;
 
 	if (vud->pane->window != client->session->active_window ||
-	    vud->pane->w == 0 || vud->pane->h == 0) {
+	    vud->pane->in_mode || vud->pane->w == 0 || vud->pane->h == 0) {
 		wlc_view_set_mask(view, 0);
 	} else {
 		int offset = client->session->statusbar == WTC_TMUX_SESSION_TOP
@@ -631,6 +631,34 @@ static int tmux_pane_resized_cb(struct wtc_tmux *tmux,
 	return 0;
 }
 
+static int tmux_pane_mode_changed_cb(struct wtc_tmux *tmux, 
+                                     const struct wtc_tmux_pane *pane)
+{
+	const wlc_handle *outputs, *views;
+	struct wtc_view *ud;
+	size_t opc, vc;
+
+	debug("Pane changed mode: %p %u", pane, pane->id);
+
+	outputs = wlc_get_outputs(&opc);
+	for (int i = 0; i < opc; ++i) {
+		views = wlc_output_get_views(outputs[i], &vc);
+		for (int j = 0; j < vc; ++j) {
+			ud = wlc_handle_get_user_data(views[j]);
+			if (!ud)
+				continue;
+
+			if (ud->pane != pane)
+				continue;
+
+			reposition_view(views[j]);
+			return 0;
+		}
+	}
+
+	return 0;
+}
+
 static int tmux_client_session_changed(struct wtc_tmux *tmux,
                                        const struct wtc_tmux_client *client)
 {
@@ -684,6 +712,8 @@ static int setup_tmux_handlers(struct wtc_tmux *tmux)
 	r =         wtc_tmux_set_new_pane_cb(tmux, tmux_new_pane_cb);
 	r = r ? r : wtc_tmux_set_pane_closed_cb(tmux, tmux_pane_closed_cb);
 	r = r ? r : wtc_tmux_set_pane_resized_cb(tmux, tmux_pane_resized_cb);
+	r = r ? r : wtc_tmux_set_pane_mode_changed_cb(tmux,
+	                                             tmux_pane_mode_changed_cb);
 	r = r ? r : wtc_tmux_set_client_session_changed_cb(tmux,
 	                                           tmux_client_session_changed);
 	r = r ? r : wtc_tmux_set_session_window_changed_cb(tmux,

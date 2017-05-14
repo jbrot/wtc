@@ -290,7 +290,7 @@ int wtc_tmux_reload_panes(struct wtc_tmux *tmux)
 	struct wtc_tmux_cb_closure cb;
 	const char *cmd[] = { "list-panes", "-aF",
 	                      "#{pane_id} #{window_id} #{pane_active} "
-	                      "#{pane_pid}", NULL };
+	                      "#{pane_pid} #{pane_in_mode}", NULL };
 	char *out = NULL;
 	r = wtc_tmux_exec(tmux, cmd, &out, NULL);
 	if (r < 0) // We swallow non-zero exit to handle no server being up
@@ -301,8 +301,9 @@ int wtc_tmux_reload_panes(struct wtc_tmux *tmux)
 	int *wids;
 	int *active;
 	int *ppids;
-	r = parselniiii("%%%u @%u %u %u%n", out, &count, &pids, &wids, &active,
-	                &ppids);
+	int *modes;
+	r = parselniiiii("%%%u @%u %u %u %u%n", out, &count, &pids, &wids,
+	                 &active, &ppids, &modes);
 	if (r < 0)
 		goto err_out;
 
@@ -434,6 +435,18 @@ int wtc_tmux_reload_panes(struct wtc_tmux *tmux)
 				goto err_pids;
 		}
 
+		if (modes[i] != pane->in_mode) {
+			pane->in_mode = modes[i];
+
+			cb.fid = WTC_TMUX_CB_PANE_MODE_CHANGED;
+			cb.tmux = tmux;
+			cb.value.pane = pane;
+			cb.free_after_use = false;
+			r = wtc_tmux_add_closure(tmux, cb);
+			if (r < 0)
+				goto err_pids;
+		}
+
 		if (prev) {
 			prev->next = pane;
 			pane->previous = prev;
@@ -482,6 +495,7 @@ err_pids:
 	free(wids);
 	free(active);
 	free(ppids);
+	free(modes);
 err_out:
 	free(out);
 	return r;

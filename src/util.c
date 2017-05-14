@@ -365,12 +365,12 @@ err_is:
 	free(is);
 	return r;
 }
-int parselniiii(const char *fmt, char *str, int *olen, int **out,
-                int **out2, int **out3, int **out4)
+int parselniiiii(const char *fmt, char *str, int *olen, int **out,
+                 int **out2, int **out3, int **out4, int **out5)
 {
 	int r = 0;
 
-	if (!fmt || !str || !olen || !out || !out2 || !out3 || !out4)
+	if (!fmt || !str || !olen || !out || !out2 || !out3 || !out4 || !out5)
 		return -EINVAL;
 
 	int count = 0;
@@ -379,29 +379,36 @@ int parselniiii(const char *fmt, char *str, int *olen, int **out,
 
 	int *is = calloc(count, sizeof(int));
 	if (!is) {
-		crit("parselniiii: couldn't allocate is!");
+		crit("parselniiiii: couldn't allocate is!");
 		return -ENOMEM;
 	}
 
 	int *is2 = calloc(count, sizeof(int));
 	if (!is2) {
-		crit("parselniiii: couldn't allocate is2!");
+		crit("parselniiiii: couldn't allocate is2!");
 		r = -ENOMEM;
 		goto err_is;
 	}
 
 	int *is3 = calloc(count, sizeof(int));
 	if (!is3) {
-		crit("parselniiii: couldn't allocate is3!");
+		crit("parselniiiii: couldn't allocate is3!");
 		r = -ENOMEM;
 		goto err_is2;
 	}
 
 	int *is4 = calloc(count, sizeof(int));
 	if (!is4) {
-		crit("parselniiii: couldn't allocate is4!");
+		crit("parselniiiii: couldn't allocate is4!");
 		r = -ENOMEM;
 		goto err_is3;
+	}
+
+	int *is5 = calloc(count, sizeof(int));
+	if (!is5) {
+		crit("parselniiiii: couldn't allocate is5!");
+		r = -ENOMEM;
+		goto err_is4;
 	}
 
 	count = 0;
@@ -409,12 +416,12 @@ int parselniiii(const char *fmt, char *str, int *olen, int **out,
 	char *pos = strtok_r(str, "\n", &svptr);
 	int linec = 0;
 	while (pos != NULL) {
-		r = sscanf(pos, fmt, &is[count], &is2[count],
-		           &is3[count], &is4[count], &linec);
-		if (r != 4 || linec != strlen(pos)) {
-			warn("parselniiii: Parse error!");
+		r = sscanf(pos, fmt, &is[count], &is2[count], &is3[count],
+		           &is4[count], &is5[count], &linec);
+		if (r != 5 || linec != strlen(pos)) {
+			warn("parselniiiii: Parse error!");
 			r = -EINVAL;
-			goto err_is4;
+			goto err_is5;
 		}
 
 		count++;
@@ -426,8 +433,11 @@ int parselniiii(const char *fmt, char *str, int *olen, int **out,
 	*out2 = is2;
 	*out3 = is3;
 	*out4 = is4;
+	*out5 = is5;
 	return 0;
 
+err_is5:
+	free(is5);
 err_is4:
 	free(is4);
 err_is3:
