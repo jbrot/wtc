@@ -190,6 +190,13 @@ int parselnis(const char *fmt, char *str, int *olen, int **out,
  */
 int parselniii(const char *fmt, char *str, int *olen, int **out, 
                int **out2, int **out3);
+/*
+ * Parse four integers per line.
+ *
+ * Example parselniii format: "$%u @%u %u %u%n"
+ */
+int parselniiii(const char *fmt, char *str, int *olen, int **out, 
+                int **out2, int **out3, int **out4);
 
 /*
  * Parse two integers and a string per line. Note that the format should 

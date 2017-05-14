@@ -49,12 +49,12 @@ struct wtc_output {
 	// Position and size of top left gridsquare of the terminal
 	int term_x, term_y, term_w, term_h;
 
-	struct wtc_tmux_client *client;
+	const struct wtc_tmux_client *client;
 };
 
 struct wtc_view {
 	pid_t pane_pid;
-	struct wtc_tmux_pane *pane;
+	const struct wtc_tmux_pane *pane;
 };
 
 static void wlc_log(enum wlc_log_type type, const char *str)
@@ -94,6 +94,7 @@ static const struct wtc_tmux_client *get_client(wlc_handle output)
 				if (pid == ud->term_pid) {
 					info("get_client: Identified client: %s!",
 					     client->name);
+					ud->client = client;
 					return client;
 				}
 				if (get_parent_pid(pid, &pid))
@@ -295,7 +296,7 @@ bool wlc_view_cr(wlc_handle view)
 		wlc_view_set_mask(view, wlc_output_get_mask(vop));
 		wlc_view_focus(view);
 	} else {
-		const char *cmd[] = { "split-window", "-t", NULL, "-F",
+		const char *cmd[] = { "split-window", "-t", NULL, "-PF",
 		                      "#{pane_pid}", NULL, NULL };
 		const struct wtc_tmux_client *client;
 		char *dpane = NULL, *dcmd = NULL;
@@ -350,27 +351,33 @@ void wlc_view_dr(wlc_handle view)
 	wlc_handle vop = wlc_view_get_output(view);
 	debug("View destroyed: %p -- %p\n", view, vop);
 
-	/*
-	if (wtc_tmux_is_connected(tmux))
-		wtc_tmux_disconnect(tmux);
-	else
-		wtc_tmux_connect(tmux);
-	*/
-
-	// If the view doesn't have an output, we're shutting down so we can't 
-	// get a list of outputs.
 	if (!vop)
 		return;
 
-	struct wtc_output *ud = wlc_handle_get_user_data(vop);
-	if (ud->term_view != view)
-		return;
+	struct wtc_output *oud = wlc_handle_get_user_data(vop);
+	if (oud->term_view == view) {
+		oud->term_pid = 0;
+		oud->term_view = 0;
+		wlc_event_source_remove(oud->term_out); oud->term_out = NULL;
+		shl_ring_pop(&(oud->term_buf), oud->term_buf.size);
+		launch_term(oud);
+	} else {
+		const char *cmd[] = { "kill-pane", "-t", NULL, NULL };
+		char *dyn = NULL;
+		struct wtc_view *vud = wlc_handle_get_user_data(view);
+		if (!vud)
+			return;
 
-	ud->term_pid = 0;
-	ud->term_view = 0;
-	wlc_event_source_remove(ud->term_out); ud->term_out = NULL;
-	shl_ring_pop(&(ud->term_buf), ud->term_buf.size);
-	launch_term(ud);
+		if (!vud->pane)
+			return;
+
+		if (bprintf(&dyn, "%%%u", vud->pane->id))
+			return;
+
+		cmd[2] = dyn;
+		wtc_tmux_exec(tmux, cmd, NULL, NULL);
+		free(dyn);
+	}
 }
 
 void wlc_view_rg(wlc_handle view, const struct wlc_geometry *geom)
@@ -454,6 +461,147 @@ void setup_wlc_handlers(void)
 	wlc_set_view_request_geometry_cb(wlc_view_rg);
 }
 
+static void reposition_view(wlc_handle view)
+{
+	const struct wtc_tmux_client *client;
+	struct wtc_output *pud;
+	struct wtc_view *vud;
+	wlc_handle output;
+
+	output = wlc_view_get_output(view);
+	if (!output)
+		return;
+
+	pud = wlc_handle_get_user_data(output);
+	if (!pud)
+		return;
+
+	client = get_client(output);
+	if (!client)
+		return;
+
+	vud = wlc_handle_get_user_data(view);
+	if (!vud || !vud->pane)
+		return;
+
+	if (vud->pane->window != client->session->active_window) {
+		wlc_view_set_mask(view, 0);
+	} else {
+		int offset = client->session->statusbar == WTC_TMUX_SESSION_TOP
+		              ? 1 : 0;
+		const struct wlc_geometry g = {
+			.origin = {
+				.x = pud->term_x + pud->term_w * vud->pane->x,
+				.y = pud->term_y + pud->term_h * (vud->pane->y + offset),
+			},
+			.size = {
+				.w = pud->term_w * vud->pane->w,
+				.h = pud->term_h * vud->pane->h,
+			},
+		};
+		wlc_view_set_geometry(view, 0, &g);
+		wlc_view_set_mask(view, wlc_output_get_mask(output));
+	}
+}
+
+static int tmux_new_pane_cb(struct wtc_tmux *tmux, 
+                            const struct wtc_tmux_pane *pane)
+{
+	const wlc_handle *outputs, *views;
+	struct wtc_view *ud;
+	size_t opc, vc;
+
+	debug("Pane created: %p %u", pane, pane->id);
+
+	outputs = wlc_get_outputs(&opc);
+	for (int i = 0; i < opc; ++i) {
+		views = wlc_output_get_views(outputs[i], &vc);
+		for (int j = 0; j < vc; ++j) {
+			ud = wlc_handle_get_user_data(views[j]);
+			if (!ud)
+				continue;
+
+			if (ud->pane_pid != pane->pid)
+				continue;
+
+			ud->pane = pane;
+			reposition_view(views[j]);
+			// wlc_view_focus(view);
+			return 0;
+		}
+	}
+
+	return 0;
+}
+
+static int tmux_pane_closed_cb(struct wtc_tmux *tmux, 
+                               const struct wtc_tmux_pane *pane)
+{
+	const wlc_handle *outputs, *views;
+	struct wtc_view *ud;
+	size_t opc, vc;
+
+	debug("Pane closed: %p %u", pane, pane->id);
+
+	outputs = wlc_get_outputs(&opc);
+	for (int i = 0; i < opc; ++i) {
+		views = wlc_output_get_views(outputs[i], &vc);
+		for (int j = 0; j < vc; ++j) {
+			ud = wlc_handle_get_user_data(views[j]);
+			if (!ud)
+				continue;
+
+			if (ud->pane != pane)
+				continue;
+
+			ud->pane = NULL;
+			wlc_view_close(views[j]);
+			return 0;
+		}
+	}
+
+	return 0;
+}
+
+static int tmux_pane_resized_cb(struct wtc_tmux *tmux, 
+                               const struct wtc_tmux_pane *pane)
+{
+	const wlc_handle *outputs, *views;
+	struct wtc_view *ud;
+	size_t opc, vc;
+
+	debug("Pane resized: %p %u", pane, pane->id);
+
+	outputs = wlc_get_outputs(&opc);
+	for (int i = 0; i < opc; ++i) {
+		views = wlc_output_get_views(outputs[i], &vc);
+		for (int j = 0; j < vc; ++j) {
+			ud = wlc_handle_get_user_data(views[j]);
+			if (!ud)
+				continue;
+
+			if (ud->pane != pane)
+				continue;
+
+			reposition_view(views[j]);
+			return 0;
+		}
+	}
+
+	return 0;
+}
+
+static int setup_tmux_handlers(struct wtc_tmux *tmux)
+{
+	int r = 0;
+
+	r =         wtc_tmux_set_new_pane_cb(tmux, tmux_new_pane_cb);
+	r = r ? r : wtc_tmux_set_pane_closed_cb(tmux, tmux_pane_closed_cb);
+	r = r ? r : wtc_tmux_set_pane_resized_cb(tmux, tmux_pane_resized_cb);
+
+	return r;
+}
+
 int main(int argc, char **argv)
 {
 	struct sigaction act;
@@ -469,10 +617,13 @@ int main(int argc, char **argv)
 	int r = wtc_tmux_new(&tmux);
 	if (r)
 		return -r;
+	r = setup_tmux_handlers(tmux);
+	if (r)
+		return -r;
 	r = wtc_tmux_set_bin_file(tmux, "/usr/local/bin/tmux");
 	if (r)
 		return -r;
-	r = wtc_tmux_set_size(tmux, 150, 25); //164, 50);
+	r = wtc_tmux_set_size(tmux, 170, 50); //164, 50);
 	if (r)
 		return -r;
 	r = wtc_tmux_set_socket_name(tmux, "test"); //164, 50);

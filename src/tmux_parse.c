@@ -285,8 +285,8 @@ int wtc_tmux_reload_panes(struct wtc_tmux *tmux)
 	int r = 0;
 	struct wtc_tmux_cb_closure cb;
 	const char *cmd[] = { "list-panes", "-aF",
-	                      "#{pane_id} #{window_id} #{pane_active}",
-	                      NULL };
+	                      "#{pane_id} #{window_id} #{pane_active} "
+	                      "#{pane_pid}", NULL };
 	char *out = NULL;
 	r = wtc_tmux_exec(tmux, cmd, &out, NULL);
 	if (r < 0) // We swallow non-zero exit to handle no server being up
@@ -296,7 +296,9 @@ int wtc_tmux_reload_panes(struct wtc_tmux *tmux)
 	int *pids;
 	int *wids;
 	int *active;
-	r = parselniii("%%%u @%u %u%n", out, &count, &pids, &wids, &active);
+	int *ppids;
+	r = parselniiii("%%%u @%u %u %u%n", out, &count, &pids, &wids, &active,
+	                &ppids);
 	if (r < 0)
 		goto err_out;
 
@@ -351,6 +353,7 @@ int wtc_tmux_reload_panes(struct wtc_tmux *tmux)
 			goto err_pids;
 		}
 		pane->id = pids[i];
+		pane->pid = ppids[i];
 		HASH_ADD_INT(tmux->panes, id, pane);
 
 		cb.fid = WTC_TMUX_CB_NEW_PANE;
@@ -461,6 +464,7 @@ err_pids:
 	free(pids);
 	free(wids);
 	free(active);
+	free(ppids);
 err_out:
 	free(out);
 	return r;
@@ -903,7 +907,7 @@ static void print_status(struct wtc_tmux *tmux)
 			wind = sess->windows[i];
 			debug("  @%u -- %u", wind->id, wind == sess->active_window);
 			for (pane = wind->panes; pane; pane = pane->next)
-				debug("    %%%u -- %u -- %ux%u,%u,%u", pane->id, pane == wind->active_pane, pane->w, pane->h, pane->x, pane->y);
+				debug("    %%%u -- %u -- %u -- %ux%u,%u,%u", pane->id, pane == wind->active_pane, pane->pid, pane->w, pane->h, pane->x, pane->y);
 		}
 		for (client = sess->clients; client; client = client->next)
 			debug("  %s -- %u", client->name, client->pid);
