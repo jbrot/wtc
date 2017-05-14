@@ -253,6 +253,10 @@ static int reload_panes_cb(int pid, int x, int y, int w, int h, void *ud)
 		return -EINVAL;
 	}
 
+	// Mark the pane as specified
+	if (pane->pid > 0)
+		pane->pid *= -1;
+
 	unchanged = (pane->x == x) && (pane->y == y) && 
 	            (pane->w == w) && (pane->h == h);
 
@@ -454,12 +458,25 @@ int wtc_tmux_reload_panes(struct wtc_tmux *tmux)
 		r = process_layout(token, tmux, reload_panes_cb);
 		if (r < 0) {
 			warn("wtc_tmux_reload_panes: Layout processing error: %d", r);
-			goto err_pids;
+			goto err_layout;
 		}
 
 		token = strtok_r(NULL, "\n", &saveptr);
 	}
 
+	for (pane = tmux->panes; pane; pane = pane->hh.next) {
+		if (pane->pid < 0)
+			continue;
+
+		r = reload_panes_cb(pane->id, 0, 0, 0, 0, tmux);
+		if (r < 0)
+			goto err_layout;
+	}
+
+err_layout:
+	for (pane = tmux->panes; pane; pane = pane->hh.next)
+		if (pane->pid < 0)
+			pane->pid *= -1;
 err_pids:
 	free(pids);
 	free(wids);

@@ -41,6 +41,8 @@
 static struct wtc_tmux *tmux;
 
 struct wtc_output {
+	struct wlc_event_source *create_timer;
+
 	pid_t term_pid;
 	wlc_handle term_view;
 	struct wlc_event_source *term_out;
@@ -385,6 +387,23 @@ void wlc_view_rg(wlc_handle view, const struct wlc_geometry *geom)
 	// Ignore request
 }
 
+static int create_cb(void *dt)
+{
+	struct wtc_output *ud = dt;
+
+	if (getenv("DISPLAY")) {
+		launch_term(ud);
+		return 0;
+	}
+
+	if (wlc_event_source_timer_update(ud->create_timer, 10))
+		return 0;
+
+	warn("create_cb: Error continuing start timer!");
+	return 1;
+}
+
+struct wlc_event_source *ev;
 bool wlc_out_cr(wlc_handle output)
 {
 	struct wtc_output *ud;
@@ -394,7 +413,7 @@ bool wlc_out_cr(wlc_handle output)
 	if (wlc_handle_get_user_data(output) == NULL) {
 		ud = calloc(1, sizeof(struct wtc_output));
 		if (!ud) {
-			crit("Could not allocate output data!");
+			crit("wlc_out_cr: Could not allocate output data!");
 			return false;
 		}
 		wlc_handle_set_user_data(output, ud);
@@ -403,8 +422,20 @@ bool wlc_out_cr(wlc_handle output)
 		ud = wlc_handle_get_user_data(output);
 	}
 
-	if (!ud->term_pid)
-		launch_term(ud);
+	if (!ud->term_pid) {
+		if (getenv("DISPLAY")) {
+			launch_term(ud);
+		} else {
+			if (!ud->create_timer) {
+				ud->create_timer = wlc_event_loop_add_timer(create_cb, ud);
+				if (!ud->create_timer) {
+					warn("wlc_out_cr: Couldn't create timer!");
+					return false;
+				}
+			}
+			wlc_event_source_timer_update(ud->create_timer, 10);
+		}
+	}
 
 	const struct wlc_size *sz = wlc_output_get_resolution(output);
 	debug("Res: %d x %d\n", sz->w, sz->h);
@@ -418,8 +449,16 @@ bool wlc_out_cr(wlc_handle output)
 void wlc_out_dr(wlc_handle output)
 {
 	debug("Output destroyed: %s\n", wlc_output_get_name(output));
-	if (wlc_handle_get_user_data(output) != NULL)
-		free(wlc_handle_get_user_data(output));
+	struct wtc_output *ud = wlc_handle_get_user_data(output);
+	if (!ud)
+		return;
+
+	if (ud->create_timer)
+		wlc_event_source_remove(ud->create_timer);
+	if (ud->term_out)
+		wlc_event_source_remove(ud->term_out);
+
+	free(ud);
 }
 
 bool wlc_kbd(wlc_handle view, uint32_t time, const struct wlc_modifiers *mods,
@@ -484,7 +523,8 @@ static void reposition_view(wlc_handle view)
 	if (!vud || !vud->pane)
 		return;
 
-	if (vud->pane->window != client->session->active_window) {
+	if (vud->pane->window != client->session->active_window ||
+	    vud->pane->w == 0 || vud->pane->h == 0) {
 		wlc_view_set_mask(view, 0);
 	} else {
 		int offset = client->session->statusbar == WTC_TMUX_SESSION_TOP
