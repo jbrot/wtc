@@ -604,7 +604,7 @@ static int tmux_pane_closed_cb(struct wtc_tmux *tmux,
 }
 
 static int tmux_pane_resized_cb(struct wtc_tmux *tmux, 
-                               const struct wtc_tmux_pane *pane)
+                                const struct wtc_tmux_pane *pane)
 {
 	const wlc_handle *outputs, *views;
 	struct wtc_view *ud;
@@ -631,6 +631,52 @@ static int tmux_pane_resized_cb(struct wtc_tmux *tmux,
 	return 0;
 }
 
+static int tmux_client_session_changed(struct wtc_tmux *tmux,
+                                       const struct wtc_tmux_client *client)
+{
+	const wlc_handle *outputs, *views;
+	struct wtc_view *ud;
+	size_t opc, vc;
+
+	debug("Client moved: %p %s", client, client->name);
+
+	outputs = wlc_get_outputs(&opc);
+	for (int i = 0; i < opc; ++i) {
+		if (get_client(outputs[i]) != client)
+			continue;
+
+		views = wlc_output_get_views(outputs[i], &vc);
+		for (int j = 0; j < vc; ++j)
+			reposition_view(views[j]);
+	}
+
+	return 0;
+}
+
+static int tmux_session_window_changed(struct wtc_tmux *tmux,
+                                       const struct wtc_tmux_session *sess)
+{
+	const wlc_handle *outputs, *views;
+	const struct wtc_tmux_client *client;
+	struct wtc_view *ud;
+	size_t opc, vc;
+
+	debug("Window changed: %p %u", sess, sess->id);
+
+	outputs = wlc_get_outputs(&opc);
+	for (int i = 0; i < opc; ++i) {
+		client = get_client(outputs[i]);
+		if (!client || client->session != sess)
+			continue;
+
+		views = wlc_output_get_views(outputs[i], &vc);
+		for (int j = 0; j < vc; ++j)
+			reposition_view(views[j]);
+	}
+
+	return 0;
+}
+
 static int setup_tmux_handlers(struct wtc_tmux *tmux)
 {
 	int r = 0;
@@ -638,7 +684,10 @@ static int setup_tmux_handlers(struct wtc_tmux *tmux)
 	r =         wtc_tmux_set_new_pane_cb(tmux, tmux_new_pane_cb);
 	r = r ? r : wtc_tmux_set_pane_closed_cb(tmux, tmux_pane_closed_cb);
 	r = r ? r : wtc_tmux_set_pane_resized_cb(tmux, tmux_pane_resized_cb);
-
+	r = r ? r : wtc_tmux_set_client_session_changed_cb(tmux,
+	                                           tmux_client_session_changed);
+	r = r ? r : wtc_tmux_set_session_window_changed_cb(tmux,
+	                                           tmux_session_window_changed);
 	return r;
 }
 
@@ -647,7 +696,7 @@ int main(int argc, char **argv)
 	struct sigaction act;
 	memset(&act, 0, sizeof(act));
 	act.sa_handler = SIG_IGN;
-	//sigaction(SIGPIPE, &act, NULL);
+	sigaction(SIGPIPE, &act, NULL);
 
 	setup_wlc_handlers();
 	if (!wlc_init()) {
