@@ -37,6 +37,7 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <limits.h>
 #include <unistd.h>
 
 int wtc_tmux_version_check(struct wtc_tmux *tmux)
@@ -910,10 +911,13 @@ int wtc_tmux_reload_sessions(struct wtc_tmux *tmux)
 	if (r)
 		goto err_sids;
 
-	// If we have no sessions, start a temporary session. Otherwise, delete
-	// said temporary session if it exists.
+	// If we have no sessions, start a temporary session.
 	if (!tmux->sessions)
 		r = wtc_tmux_cc_launch(tmux, NULL);
+	if (r)
+		goto err_sids;
+
+	r = wtc_tmux_reload_key_binds(tmux);
 err_sids:
 	if (names) {
 		for (int i = 0; i < count; ++i)
@@ -921,6 +925,265 @@ err_sids:
 	}
 	free(names);
 	free(sids);
+err_out:
+	free(out);
+	return r;
+}
+
+/*
+ * This function parses the list-keys output to find the starting offset
+ * in each line for the key codes (put in *keycode) and commands (put in
+ * *cmd). Returns 0 on success, -EINVAL if keycode or cmd are NULL, -EINVAL
+ * if there is a parse error, or -ENOMEM if there is an allocation error.
+ *
+ * NOTE: This function assumes text ends with a newline immediately before
+ * the \0. If there is no terminating new line, behavior is indeterminate.
+ */
+static int find_offsets(const char *text, int *keycode, int *cmd)
+{
+	const int prefix_len = strlen("bind-key -r -T ");
+
+	if (!keycode || !cmd)
+		return -EINVAL;
+
+	// First, determine the minimum line length.
+	int min_ll = INT_MAX;
+	int ll = 0;
+	for (int i = 0; text[i]; ++i) {
+		if (text[i] == '\n') {
+			min_ll = min_ll < ll ? min_ll : ll;
+			ll = 0;
+			continue;
+		}
+
+		++ll;
+	}
+
+	// We must have at least prefix_len (and should probably have a /lot/
+	// longer).
+	if (min_ll <= prefix_len) {
+		warn("find_offsets: Minimum line too small: %d", min_ll);
+		return -EINVAL;
+	}
+
+	// Search for candidate offsets. An offset is a cnadidate offset if it's
+	// a space in every line.
+	bool *spc = malloc(min_ll * sizeof(bool));
+	if (!spc) {
+		crit("find_offsets: Couldn't allocate spc!");
+		return -ENOMEM;
+	}
+	memset(spc, true, min_ll * sizeof(bool));
+
+	ll = 0;
+	for (int i = 0; text[i]; ++i) {
+		if (text[i] == '\n') {
+			ll = 0;
+			continue;
+		}
+
+		if (ll >= min_ll)
+			continue;
+
+		spc[ll] = spc[ll] && (text[i] == ' ');
+		++ll;
+	}
+
+	// 0 - table name 1 - candidate 2 - key name 3 - candidate (4 - cmd)
+	int kc = 0, cm = 0;
+	int state = 0;
+	for (int i = prefix_len; i < min_ll; ++i) {
+		switch (state) {
+		case 0:
+			if (spc[i])
+				state = 1;
+			break;
+		case 1:
+			if (spc[i])
+				break;
+			kc = i;
+			state = 2;
+			break;
+		case 2:
+			if (spc[i])
+				state = 3;
+			break;
+		case 3:
+			if (spc[i])
+				break;
+			cm = i;
+			goto out; // break for loop.
+		}
+	}
+out:
+	free(spc);
+
+	if (!kc) {
+		warn("find_offsets: Couldn't find key code offset!");
+		return -EINVAL;
+	} else if (!cm) {
+		warn("find_offsets: Couldn't find command offset!");
+		return -EINVAL;
+	}
+
+	*keycode = kc;
+	*cmd = cm;
+	return 0;
+}
+
+static int get_table(struct wtc_tmux *tmux, const char *name,
+                     struct wtc_tmux_key_table **out)
+{
+	struct wtc_tmux_key_table *table;
+	HASH_FIND(hh, tmux->tables, name, strlen(name), table);
+
+	if (table) {
+		*out = table;
+		return 0;
+	}
+
+	table = calloc(1, sizeof(struct wtc_tmux_key_table));
+	if (!table) {
+		crit("get_table: Couldn't allocate table!");
+		return -ENOMEM;
+	}
+
+	table->name = strdup(name);
+	if (!table->name) {
+		crit("get_table: Couldn't allocate table name!");
+		free(table);
+		return -ENOMEM;
+	}
+
+	HASH_ADD_KEYPTR(hh, tmux->tables, table->name, strlen(table->name),
+	                table);
+
+	*out = table;
+	return 0;
+}
+
+int wtc_tmux_reload_key_binds(struct wtc_tmux *tmux)
+{
+	int r = 0;
+	const char *cmd[] = { "list-keys", NULL };
+	char *out = NULL;
+	r = wtc_tmux_exec(tmux, cmd, &out, NULL);
+	if (r < 0) // We swallow non-zero exit to handle no server being up
+		goto err_out;
+
+	int keyp, cmdp;
+	r = find_offsets(out, &keyp, &cmdp);
+	if (r < 0)
+		goto err_out;
+
+	// Mark all the existing key bindings so we'll know who to delete.
+	struct wtc_tmux_key_table *table;
+	struct wtc_tmux_key_bind *bind;
+	for (table = tmux->tables; table; table = table->hh.next)
+		for (bind = table->binds; bind; bind = bind->hh.next)
+			bind->table = NULL;
+
+	const int repeat_pos = strlen("bind-key -");
+	const int table_pos  = strlen("bind-key -r -T ");
+
+	int ll = 0;
+	bool repeat = false, in = false;
+	for (int i = 0; out[i]; ++i) {
+		if (out[i] == '\n') {
+			if (in && bind) {
+				// TODO parse next table (way easier than it sounds)
+				r = get_table(tmux, "root", &table);
+				if (r < 0)
+					goto err_out;
+
+				bind->next_table = table;
+			}
+			ll = 0;
+			repeat = false;
+			in = false;
+			bind = NULL;
+			table = NULL;
+			continue;
+		}
+
+		if (ll == repeat_pos)
+			repeat = out[i] == 'r';
+
+		if (ll == keyp) {
+			char *start, *end;
+
+			start = &out[i + (table_pos - ll)];
+			end = &out[i - 1];
+			while (*end == ' ') {
+				*end = '\0';
+				--end;
+			}
+
+			r = get_table(tmux, start, &table);
+			if (r < 0)
+				goto err_out;
+
+			in = true;
+		}
+
+		if (ll == cmdp)
+			in = true;
+
+		if (in && out[i] == ' ' && ll < cmdp) {
+			key_code code;
+			char * start;
+
+			out[i] = '\0';
+			start = &out[i + (keyp - ll)];
+			code = key_string_lookup_string(start);
+
+			if (code == KEYC_NONE || code == KEYC_UNKNOWN) {
+				warn("wtc_tmux_reload_key_binds: Unknown key: %s!", start);
+			} else {
+				HASH_FIND(hh, table->binds, &code, sizeof(code), bind);
+				if (!bind) {
+					bind = calloc(1, sizeof(struct wtc_tmux_key_bind));
+					if (!bind) {
+						crit("wtc_tmux_reload_key_binds: Couldn't allocate "
+						     "bind!");
+						r = -ENOMEM;
+						goto err_out;
+					}
+
+					bind->code = code;
+					HASH_ADD(hh, table->binds, code, sizeof(code), bind);
+				}
+
+				bind->table = table;
+				bind->repeat = repeat;
+			}
+
+			in = false;
+		}
+
+		++ll;
+	}
+
+	// Clean up existing bindings.
+	struct wtc_tmux_key_table *ttbl;
+	struct wtc_tmux_key_bind *tbnd;
+	HASH_ITER(hh, tmux->tables, table, ttbl) {
+		HASH_ITER(hh, table->binds, bind, tbnd) {
+			if (bind->table)
+				continue;
+
+			HASH_DEL(table->binds, bind);
+			free(bind);
+		}
+
+		if (table->binds)
+			continue;
+
+		HASH_DEL(tmux->tables, table);
+		free((void *) table->name);
+		free(table);
+	}
+
 err_out:
 	free(out);
 	return r;

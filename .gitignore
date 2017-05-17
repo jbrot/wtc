@@ -18,3 +18,4 @@ m4/
 stamp-*
 .deps
 .dirstamp
+.vimrc

@@ -31,6 +31,9 @@
 
 // TODO Figure out how to put this into the config file.
 #define WTC_COLORS_256
+// This is a horrible hack but necessary for piping.
+#undef stderr
+#define stderr stdout
 
 #ifdef WTC_COLORS_256
 

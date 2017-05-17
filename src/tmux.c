@@ -598,6 +598,8 @@ void wtc_tmux_disconnect(struct wtc_tmux *tmux)
 	struct wtc_tmux_window *window, *tmpw;
 	struct wtc_tmux_client *client, *tmpc;
 	struct wtc_tmux_session *sess, *tmps;
+	struct wtc_tmux_key_table *table, *tmpt;
+	struct wtc_tmux_key_bind *bind, *tmpb;
 
 	HASH_ITER(hh, tmux->panes, pane, tmpp) {
 		HASH_DEL(tmux->panes, pane);
@@ -617,6 +619,17 @@ void wtc_tmux_disconnect(struct wtc_tmux *tmux)
 	HASH_ITER(hh, tmux->sessions, sess, tmps) {
 		HASH_DEL(tmux->sessions, sess);
 		wtc_tmux_session_free(sess);
+	}
+
+	HASH_ITER(hh, tmux->tables, table, tmpt) {
+		HASH_ITER(hh, table->binds, bind, tmpb) {
+			HASH_DEL(table->binds, bind);
+			free(bind);
+		}
+
+		HASH_DEL(tmux->tables, table);
+		free((void *)table->name);
+		free(table);
 	}
 
 	tmux->connected = false;

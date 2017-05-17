@@ -112,6 +112,7 @@ struct wtc_tmux {
 	struct wtc_tmux_window *windows;
 	struct wtc_tmux_session *sessions;
 	struct wtc_tmux_client *clients;
+	struct wtc_tmux_key_table *tables;
 
 	struct sigaction restore;
 	struct wlc_event_source *sigc;
@@ -326,6 +327,18 @@ int wtc_tmux_reload_clients(struct wtc_tmux *tmux);
  * TODO Possibly patch tmux to allow atomic queries.
  */
 int wtc_tmux_reload_sessions(struct wtc_tmux *tmux);
+
+/*
+ * Reload the key bindings on the server. Note that depending on where this 
+ * fails, the key bindings may be left in a corrupted state and the only 
+ * viable method of recovery is to try the entire process again.
+ *
+ * WARNING: There is a race condition. This function relies on many
+ * sequential calls to the server with no guarantees of atomicity. If
+ * the server changes state while this function is running, bad things
+ * will happen.
+ */
+int wtc_tmux_reload_key_binds(struct wtc_tmux *tmux);
 
 /*
  * This function gets called whenever a wtc_tmux_cc's process outputs data.

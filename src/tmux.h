@@ -49,11 +49,14 @@
 
 #include <stdbool.h>
 
+#include "tmux_keycode.h"
 #include "uthash.h"
 
 struct wtc_tmux;
 struct wtc_tmux_client;
 struct wtc_tmux_window;
+struct wtc_tmux_key_table;
+struct wtc_tmux_key_bind;
 
 /*
  * Describes a tmux pane. A pane represents one pseudo terminal which may be
@@ -214,6 +217,57 @@ struct wtc_tmux_client
 	/* So we can be in a hash map. */
 	UT_hash_handle hh;
 };
+
+/*
+ * A wtc_tmux_key_table is a name collection of key bindings. By default,
+ * one is in the root key table. When a bound key is pressed, a variety of
+ * effects may happen. Relevant here, an effect is switching key tables.
+ * For instance, the prefix key transitions into the prefix key table. This
+ * allows for a lot of bindings which don't interfere with normal typing.
+ */
+struct wtc_tmux_key_table
+{
+	/* This wtc_tmux_key_table's name. */
+	const char *name;
+
+	/* A UT_hash of the key bindings in this table, by key_code. */
+	struct wtc_tmux_key_bind *binds;
+
+	/* So we can be in a hash map. */
+	UT_hash_handle hh;
+};
+
+/*
+ * A key binding represents an action which may be taken after a key is
+ * pressed. Key bindings are grouped into tables. Each key binding is
+ * identified by its key_code (see tmux_keycode.h for details on what
+ * specific values mean). After pressing a key binding, the current key
+ * table transitions. Normally, we switch into the root key table, however
+ * certain bindings may specify a different table to transition into (for
+ * instance the prefix key transitions into the prefix table). Note that if
+ * a key is pressed which is not bound, we always transition into the root
+ * key table.
+ */
+struct wtc_tmux_key_bind
+{
+	/* The key_code which activates this binding. */
+	key_code code;
+
+	/* Can this key be held down to repeat the command. */
+	bool repeat;
+
+	/* The wtc_tmux_key_table which contains this key binding. */
+	struct wtc_tmux_key_table *table;
+	/* 
+	 * The wtc_tmux_key_table we transition into after this key binding is
+	 * pressed.
+	 */
+	struct wtc_tmux_key_table *next_table;
+
+	/* So we can be in a hash map. */
+	UT_hash_handle hh;
+};
+
 
 /*
  * Create a new wtc_tmux object. This can fail with -ENOMEM.
@@ -406,6 +460,9 @@ wtc_tmux_lookup_window(const struct wtc_tmux *tmux, int id);
 
 const struct wtc_tmux_pane *
 wtc_tmux_lookup_pane(const struct wtc_tmux *tmux, int id);
+
+const struct wtc_tmux_key_table *
+wtc_tmux_lookup_key_table(const struct wtc_tmux *tmux, const char *name);
 
 /*
  * Get the first session in the linked list associated with this tmux

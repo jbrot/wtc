@@ -59,6 +59,8 @@ struct wtc_view {
 	const struct wtc_tmux_pane *pane;
 };
 
+static void reposition_view(wlc_handle view);
+
 static void wlc_log(enum wlc_log_type type, const char *str)
 {
 	switch(type) {
@@ -75,7 +77,6 @@ static void wlc_log(enum wlc_log_type type, const char *str)
 		info("[wayland] %s", str);
 	}
 }
-
 
 static const struct wtc_tmux_client *get_client(wlc_handle output)
 {
@@ -274,8 +275,6 @@ err_pid:
 
 bool wlc_view_cr(wlc_handle view)
 {
-	debug("wlc_view_cr");
-	// First check if this is a terminal and handle appropriately.
 	pid_t pid = wlc_view_get_pid(view);
 	wlc_handle vop = wlc_view_get_output(view);
 
@@ -297,6 +296,9 @@ bool wlc_view_cr(wlc_handle view)
 		wlc_view_set_geometry(view, 0, &g);
 		wlc_view_set_mask(view, wlc_output_get_mask(vop));
 		wlc_view_focus(view);
+	} else if (wlc_view_get_parent(view) && 
+	           wlc_view_positioner_get_anchor_rect(view)) {
+		reposition_view(view);
 	} else {
 		const char *cmd[] = { "split-window", "-t", NULL, "-PF",
 		                      "#{pane_pid}", NULL, NULL };
@@ -360,6 +362,9 @@ void wlc_view_dr(wlc_handle view)
 	if (oud->term_view == view) {
 		oud->term_pid = 0;
 		oud->term_view = 0;
+		// TODO we should probably have a better method of determining when
+		// the client no longer exists.
+		oud->client = NULL;
 		wlc_event_source_remove(oud->term_out); oud->term_out = NULL;
 		shl_ring_pop(&(oud->term_buf), oud->term_buf.size);
 		launch_term(oud);
@@ -441,7 +446,7 @@ bool wlc_out_cr(wlc_handle output)
 	debug("Res: %d x %d\n", sz->w, sz->h);
 
 	// TODO This needs to be more extensible
-	wlc_output_set_resolution(output, wlc_output_get_resolution(output), 2);
+	wlc_output_set_resolution(output, wlc_output_get_resolution(output), 1);
 
 	return true;
 }
@@ -500,12 +505,77 @@ void setup_wlc_handlers(void)
 	wlc_set_view_request_geometry_cb(wlc_view_rg);
 }
 
+/*
+ * Based on the current tmux state, should the given view be displayed?
+ * Returns 1 if yes, 0 if no. If there is missing information, returns -1.
+ */
+static int is_visible(wlc_handle view)
+{
+	const struct wtc_tmux_client *client;
+	struct wtc_view *vud;
+	wlc_handle output;
+
+	// If we have a positioner, defer to our parent (if it exists)
+	if (wlc_view_positioner_get_anchor_rect(view)) {
+		wlc_handle parent = wlc_view_get_parent(view);
+		if (parent)
+			return is_visible(parent);
+	}
+
+	output = wlc_view_get_output(view);
+	if (!output)
+		return -1;
+
+	client = get_client(output);
+	if (!client)
+		return -1;
+
+	vud = wlc_handle_get_user_data(view);
+	if (!vud || !vud->pane)
+		return -1;
+
+	return vud->pane->window == client->session->active_window &&
+	       !(vud->pane->in_mode) && vud->pane->w > 0 && vud->pane->h > 0;
+}
+
 static void reposition_view(wlc_handle view)
 {
+	const struct wlc_geometry *anchor_rect;
 	const struct wtc_tmux_client *client;
 	struct wtc_output *pud;
 	struct wtc_view *vud;
-	wlc_handle output;
+	wlc_handle output, parent;
+
+	switch (is_visible(view)) {
+	case -1:
+		return;
+	case 0:
+		wlc_view_set_mask(view, 0);
+		return;
+	default:
+		break;
+	}
+
+	/* Adapted from wlc example. */
+	anchor_rect = wlc_view_positioner_get_anchor_rect(view);
+	parent = wlc_view_get_parent(view);
+	if (anchor_rect && parent) {
+		struct wlc_size size_req = *wlc_view_positioner_get_size(view);
+		if ((size_req.w <= 0) || (size_req.h <= 0))
+			size_req = wlc_view_get_geometry(view)->size;
+
+		const struct wlc_geometry *pg = wlc_view_get_geometry(parent);
+		const struct wlc_geometry g = {
+			.origin = {
+				.x = pg->origin.x + anchor_rect->origin.x,
+				.y = pg->origin.y + anchor_rect->origin.y,
+			},
+			.size = size_req,
+		};
+		wlc_view_set_geometry(view, 0, &g);
+		wlc_view_set_mask(view, wlc_output_get_mask(output));
+		return;
+	}
 
 	output = wlc_view_get_output(view);
 	if (!output)
@@ -523,25 +593,20 @@ static void reposition_view(wlc_handle view)
 	if (!vud || !vud->pane)
 		return;
 
-	if (vud->pane->window != client->session->active_window ||
-	    vud->pane->in_mode || vud->pane->w == 0 || vud->pane->h == 0) {
-		wlc_view_set_mask(view, 0);
-	} else {
-		int offset = client->session->statusbar == WTC_TMUX_SESSION_TOP
-		              ? 1 : 0;
-		const struct wlc_geometry g = {
-			.origin = {
-				.x = pud->term_x + pud->term_w * vud->pane->x,
-				.y = pud->term_y + pud->term_h * (vud->pane->y + offset),
-			},
-			.size = {
-				.w = pud->term_w * vud->pane->w,
-				.h = pud->term_h * vud->pane->h,
-			},
-		};
-		wlc_view_set_geometry(view, 0, &g);
-		wlc_view_set_mask(view, wlc_output_get_mask(output));
-	}
+	int offset = client->session->statusbar == WTC_TMUX_SESSION_TOP
+	              ? 1 : 0;
+	const struct wlc_geometry g = {
+		.origin = {
+			.x = pud->term_x + pud->term_w * vud->pane->x,
+			.y = pud->term_y + pud->term_h * (vud->pane->y + offset),
+		},
+		.size = {
+			.w = pud->term_w * vud->pane->w,
+			.h = pud->term_h * vud->pane->h,
+		},
+	};
+	wlc_view_set_geometry(view, 0, &g);
+	wlc_view_set_mask(view, wlc_output_get_mask(output));
 }
 
 static int tmux_new_pane_cb(struct wtc_tmux *tmux, 
