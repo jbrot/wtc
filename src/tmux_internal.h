@@ -251,7 +251,7 @@ int wtc_tmux_cc_exec(struct wtc_tmux_cc *cc, const char *const *cmds,
 /*
  * Retrieve the value of the option specified by name. The trailing newline
  * will be omitted in *out. Mode can be a bitwise or of several of the
- * gollowing flags. If the global or server flags are set, then target is
+ * following flags. If the global or server flags are set, then target is
  * ignored. If the session flag is set, then target will be used to
  * determine which session to query and likewise for the window flag.
  *

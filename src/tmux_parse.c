@@ -1062,10 +1062,36 @@ static int get_table(struct wtc_tmux *tmux, const char *name,
 	return 0;
 }
 
+static int get_bind(struct wtc_tmux_key_table *table, key_code code,
+                    struct wtc_tmux_key_bind **out)
+{
+	struct wtc_tmux_key_bind *bind;
+	HASH_FIND(hh, table->binds, &code, sizeof(code), bind);
+	if (bind) {
+		*out = bind;
+		return 0;
+	}
+
+	bind = calloc(1, sizeof(struct wtc_tmux_key_bind));
+	if (!bind) {
+		crit("get_bind: Couldn't allocate bind!");
+		return -ENOMEM;
+	}
+
+	bind->code = code;
+	HASH_ADD(hh, table->binds, code, sizeof(code), bind);
+
+	*out = bind;
+	return 0;
+}
+
 int wtc_tmux_reload_key_binds(struct wtc_tmux *tmux)
 {
-	int r = 0;
+	const int repeat_pos = strlen("bind-key -");
+	const int table_pos  = strlen("bind-key -r -T ");
 	const char *cmd[] = { "list-keys", NULL };
+	int r = 0;
+
 	char *out = NULL;
 	r = wtc_tmux_exec(tmux, cmd, &out, NULL);
 	if (r < 0) // We swallow non-zero exit to handle no server being up
@@ -1083,20 +1109,19 @@ int wtc_tmux_reload_key_binds(struct wtc_tmux *tmux)
 		for (bind = table->binds; bind; bind = bind->hh.next)
 			bind->table = NULL;
 
-	const int repeat_pos = strlen("bind-key -");
-	const int table_pos  = strlen("bind-key -r -T ");
+	struct wtc_tmux_key_table *root;
+	r = get_table(tmux, "root", &root);
+	if (r < 0)
+		goto err_clean;
 
 	int ll = 0;
+	key_code code;
 	bool repeat = false, in = false;
 	for (int i = 0; out[i]; ++i) {
 		if (out[i] == '\n') {
 			if (in && bind) {
 				// TODO parse next table (way easier than it sounds)
-				r = get_table(tmux, "root", &table);
-				if (r < 0)
-					goto err_out;
-
-				bind->next_table = table;
+				bind->next_table = root;
 			}
 			ll = 0;
 			repeat = false;
@@ -1121,7 +1146,7 @@ int wtc_tmux_reload_key_binds(struct wtc_tmux *tmux)
 
 			r = get_table(tmux, start, &table);
 			if (r < 0)
-				goto err_out;
+				goto err_clean;
 
 			in = true;
 		}
@@ -1130,8 +1155,7 @@ int wtc_tmux_reload_key_binds(struct wtc_tmux *tmux)
 			in = true;
 
 		if (in && out[i] == ' ' && ll < cmdp) {
-			key_code code;
-			char * start;
+			char *start;
 
 			out[i] = '\0';
 			start = &out[i + (keyp - ll)];
@@ -1140,19 +1164,9 @@ int wtc_tmux_reload_key_binds(struct wtc_tmux *tmux)
 			if (code == KEYC_NONE || code == KEYC_UNKNOWN) {
 				warn("wtc_tmux_reload_key_binds: Unknown key: %s!", start);
 			} else {
-				HASH_FIND(hh, table->binds, &code, sizeof(code), bind);
-				if (!bind) {
-					bind = calloc(1, sizeof(struct wtc_tmux_key_bind));
-					if (!bind) {
-						crit("wtc_tmux_reload_key_binds: Couldn't allocate "
-						     "bind!");
-						r = -ENOMEM;
-						goto err_out;
-					}
-
-					bind->code = code;
-					HASH_ADD(hh, table->binds, code, sizeof(code), bind);
-				}
+				r = get_bind(table, code, &bind);
+				if (r < 0)
+					goto err_out;
 
 				bind->table = table;
 				bind->repeat = repeat;
@@ -1164,6 +1178,51 @@ int wtc_tmux_reload_key_binds(struct wtc_tmux *tmux)
 		++ll;
 	}
 
+	// Handle prefixes.
+	struct wtc_tmux_key_table *prefix;
+	r = get_table(tmux, "prefix", &prefix);
+	if (r < 0)
+		goto err_clean;
+
+	free(out); out = NULL;
+	r = wtc_tmux_get_option(tmux, "prefix", 0, WTC_TMUX_OPTION_SERVER,
+	                        &out);
+	if (r < 0)
+		goto err_clean;
+
+	code = key_string_lookup_string(out);
+	if (code == KEYC_UNKNOWN) {
+		warn("wtc_tmux_reload_key_binds: Unknown key: %s", out);
+	} else if (code != KEYC_NONE) {
+		r = get_bind(table, code, &bind);
+		if (r < 0)
+			goto err_clean;
+
+		bind->repeat = false;
+		bind->table = root;
+		bind->next_table = prefix;
+	}
+
+	free(out); out = NULL;
+	r = wtc_tmux_get_option(tmux, "prefix2", 0, WTC_TMUX_OPTION_SERVER,
+	                        &out);
+	if (r < 0)
+		goto err_clean;
+
+	code = key_string_lookup_string(out);
+	if (code == KEYC_UNKNOWN) {
+		warn("wtc_tmux_reload_key_binds: Unknown key: %s", out);
+	} else if (code != KEYC_NONE) {
+		r = get_bind(table, code, &bind);
+		if (r < 0)
+			goto err_clean;
+
+		bind->repeat = false;
+		bind->table = root;
+		bind->next_table = prefix;
+	}
+
+err_clean: ;
 	// Clean up existing bindings.
 	struct wtc_tmux_key_table *ttbl;
 	struct wtc_tmux_key_bind *tbnd;
@@ -1183,7 +1242,6 @@ int wtc_tmux_reload_key_binds(struct wtc_tmux *tmux)
 		free((void *) table->name);
 		free(table);
 	}
-
 err_out:
 	free(out);
 	return r;
