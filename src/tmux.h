@@ -166,6 +166,12 @@ struct wtc_tmux_session
 #define WTC_TMUX_SESSION_TOP 1
 #define WTC_TMUX_SESSION_BOTTOM 2
 
+	/*
+	 * The sessions prefix and prefix2 keys.
+	 */
+	key_code prefix;
+	key_code prefix2;
+
 	/* The window this session is currently viewing. */
 	struct wtc_tmux_window *active_window;
 	/* The number of windows linked to this session. */
@@ -253,6 +259,9 @@ struct wtc_tmux_key_bind
 	/* The key_code which activates this binding. */
 	key_code code;
 
+	/* The command which will be executed when this key binding is run. */
+	const char *cmd;
+
 	/* Can this key be held down to repeat the command. */
 	bool repeat;
 
@@ -267,7 +276,6 @@ struct wtc_tmux_key_bind
 	/* So we can be in a hash map. */
 	UT_hash_handle hh;
 };
-
 
 /*
  * Create a new wtc_tmux object. This can fail with -ENOMEM.
@@ -502,5 +510,20 @@ wtc_tmux_root_session(const struct wtc_tmux *tmux);
  */
 int wtc_tmux_exec(struct wtc_tmux *tmux, const char *const *cmds,
                   char **out, char **err);
+
+/*
+ * Functions the same as wtc_tmux_exec, only instead of running the command
+ * in an arbitrary manner, the command is run on the specified session. If
+ * the session does not have a control client, -EINVAL will be returned
+ * (although this is indicative of a larger problem and should not matter).
+ *
+ * One other key difference is that the entire command is specified in text
+ * instead of having it split up by spaces. I would prefer the double array
+ * interface, but I need to be able to provide the whole string in wtc, so
+ * what can you do...
+ */
+int wtc_tmux_session_exec(struct wtc_tmux *tmux,
+                          const struct wtc_tmux_session *sess,
+                          const char *text, char **out, char **err);
 
 #endif // !WTC_TMUX_H

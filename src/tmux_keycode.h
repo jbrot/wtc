@@ -25,6 +25,8 @@
  * key bindings.
  */
 
+#include <stdint.h>
+
 /* Special key codes. */
 #define KEYC_NONE 0xffff00000000ULL
 #define KEYC_UNKNOWN 0xfffe00000000ULL
@@ -145,3 +147,4 @@ enum {
 
 /* key_string.c */
 key_code key_string_lookup_string(const char *string);
+key_code key_code_from_xkb_key_char(uint32_t key, uint32_t chr);

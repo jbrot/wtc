@@ -52,6 +52,8 @@ struct wtc_output {
 	int term_x, term_y, term_w, term_h;
 
 	const struct wtc_tmux_client *client;
+	char *table_name;
+	int tnlen;
 };
 
 struct wtc_view {
@@ -76,6 +78,28 @@ static void wlc_log(enum wlc_log_type type, const char *str)
 	case  WLC_LOG_WAYLAND:
 		info("[wayland] %s", str);
 	}
+}
+
+static int set_table_name(struct wtc_output *op, const char *name)
+{
+	int len;
+
+	if (!op || !name)
+		return -EINVAL;
+
+	len = strlen(name);
+	if (len > op->tnlen) {
+		char *tmp = realloc(op->table_name, (len + 1) * sizeof(char));
+		if (!tmp) {
+			crit("set_table_name: Could not resize table_name!");
+			return -ENOMEM;
+		}
+		op->table_name = tmp;
+		op->tnlen = len + 1;
+	}
+
+	strcpy(op->table_name, name);
+	return 0;
 }
 
 static const struct wtc_tmux_client *get_client(wlc_handle output)
@@ -421,8 +445,15 @@ bool wlc_out_cr(wlc_handle output)
 			crit("wlc_out_cr: Could not allocate output data!");
 			return false;
 		}
+		ud->tnlen = 10;
+		ud->table_name = calloc(10, sizeof(char));
+		if (!ud->table_name) {
+			crit("wlc_out_cr: Could not allocate table name!");
+			free(ud);
+			return false;
+		}
+		strcpy(ud->table_name, "root");
 		wlc_handle_set_user_data(output, ud);
-
 	} else {
 		ud = wlc_handle_get_user_data(output);
 	}
@@ -463,24 +494,86 @@ void wlc_out_dr(wlc_handle output)
 	if (ud->term_out)
 		wlc_event_source_remove(ud->term_out);
 
+	free(ud->table_name);
 	free(ud);
 }
 
-bool wlc_kbd(wlc_handle view, uint32_t time, const struct wlc_modifiers *mods,
-             uint32_t key, enum wlc_key_state state)
+bool wlc_kbd(wlc_handle view, uint32_t time,
+             const struct wlc_modifiers *mods, uint32_t key,
+             enum wlc_key_state state)
 {
-	uint32_t sym = wlc_keyboard_get_keysym_for_key(key, NULL);
+	const struct wtc_tmux_key_table *table;
+	const struct wtc_tmux_key_bind *bind;
+	const struct wtc_tmux_client *client;
+	struct wtc_output *ud;
+	wlc_handle output;
+	uint32_t sym, chr;
+	key_code code;
 
-	switch(sym)
-	{
-	case XKB_KEY_q:
-		if (state != WLC_KEY_STATE_PRESSED || mods->mods != WLC_BIT_MOD_LOGO)
-			break;
+	// TODO Handle repeated keys
+	if (state != WLC_KEY_STATE_PRESSED)
+		return false;
 
+	sym = wlc_keyboard_get_keysym_for_key(key, NULL);
+	if (sym == XKB_KEY_q && state == WLC_KEY_STATE_PRESSED
+	                     && mods->mods == WLC_BIT_MOD_CTRL) {
 		wlc_terminate();
 		return true;
 	}
 
+	if (!view)
+		return false;
+
+	output = wlc_view_get_output(view);
+	if (!output)
+		return false;
+
+	ud = wlc_handle_get_user_data(output);
+	if (!ud)
+		return false;
+
+	client = get_client(output);
+	if (!client)
+		return false;
+
+	if (ud->term_view == view)
+		goto ignore;
+
+	table = wtc_tmux_lookup_key_table(tmux, ud->table_name);
+	if (!table)
+		goto ignore;
+
+	chr = wlc_keyboard_get_utf32_for_key(key, mods);
+	code = key_code_from_xkb_key_char(sym, chr);
+	if (code < 128)
+		debug("Pressed: %c", code);
+
+	if (code == KEYC_NONE || code == KEYC_UNKNOWN)
+		return false;
+
+	HASH_FIND(hh, table->binds, &code, sizeof(code), bind);
+	if (bind) {
+		if (set_table_name(ud, bind->next_table->name))
+			return false;
+		// If we didn't switch back to root then this is a switch command
+		// so we don't execute anything
+		if (strcmp(bind->next_table->name, "root") != 0)
+			return true;
+
+		wtc_tmux_session_exec(tmux, client->session, bind->cmd, NULL, NULL);
+		return true;
+	}
+
+	if (strcmp(ud->table_name, "root") == 0) {
+		if (code == client->session->prefix ||
+		    code == client->session->prefix2) {
+			strcpy(ud->table_name, "prefix");
+			return true;
+		}
+	}
+
+ignore:
+	strcpy(ud->table_name, "root");
 	return false;
 }
 
@@ -607,10 +700,13 @@ static void reposition_view(wlc_handle view)
 	};
 	wlc_view_set_geometry(view, 0, &g);
 	wlc_view_set_mask(view, wlc_output_get_mask(output));
+
+	if (vud->pane->active)
+		wlc_view_focus(view);
 }
 
-static int tmux_new_pane_cb(struct wtc_tmux *tmux, 
-                            const struct wtc_tmux_pane *pane)
+static int tmux_new_pane(struct wtc_tmux *tmux, 
+                         const struct wtc_tmux_pane *pane)
 {
 	const wlc_handle *outputs, *views;
 	struct wtc_view *ud;
@@ -631,7 +727,8 @@ static int tmux_new_pane_cb(struct wtc_tmux *tmux,
 
 			ud->pane = pane;
 			reposition_view(views[j]);
-			// wlc_view_focus(view);
+			if (pane->active)
+				wlc_view_focus(views[j]);
 			return 0;
 		}
 	}
@@ -639,8 +736,8 @@ static int tmux_new_pane_cb(struct wtc_tmux *tmux,
 	return 0;
 }
 
-static int tmux_pane_closed_cb(struct wtc_tmux *tmux, 
-                               const struct wtc_tmux_pane *pane)
+static int tmux_pane_closed(struct wtc_tmux *tmux, 
+                            const struct wtc_tmux_pane *pane)
 {
 	const wlc_handle *outputs, *views;
 	struct wtc_view *ud;
@@ -668,8 +765,8 @@ static int tmux_pane_closed_cb(struct wtc_tmux *tmux,
 	return 0;
 }
 
-static int tmux_pane_resized_cb(struct wtc_tmux *tmux, 
-                                const struct wtc_tmux_pane *pane)
+static int tmux_pane_resized(struct wtc_tmux *tmux, 
+                             const struct wtc_tmux_pane *pane)
 {
 	const wlc_handle *outputs, *views;
 	struct wtc_view *ud;
@@ -696,8 +793,8 @@ static int tmux_pane_resized_cb(struct wtc_tmux *tmux,
 	return 0;
 }
 
-static int tmux_pane_mode_changed_cb(struct wtc_tmux *tmux, 
-                                     const struct wtc_tmux_pane *pane)
+static int tmux_pane_mode_changed(struct wtc_tmux *tmux, 
+                                  const struct wtc_tmux_pane *pane)
 {
 	const wlc_handle *outputs, *views;
 	struct wtc_view *ud;
@@ -724,23 +821,44 @@ static int tmux_pane_mode_changed_cb(struct wtc_tmux *tmux,
 	return 0;
 }
 
-static int tmux_client_session_changed(struct wtc_tmux *tmux,
-                                       const struct wtc_tmux_client *client)
+static int tmux_window_pane_changed(struct wtc_tmux *tmux,
+                                       const struct wtc_tmux_window *wind)
 {
 	const wlc_handle *outputs, *views;
-	struct wtc_view *ud;
+	const struct wtc_tmux_client *client;
+	struct wtc_output *oud;
+	struct wtc_view *vud;
 	size_t opc, vc;
+	bool found;
 
-	debug("Client moved: %p %s", client, client->name);
+	debug("Pane changed: %p %u", wind, wind->id);
 
 	outputs = wlc_get_outputs(&opc);
 	for (int i = 0; i < opc; ++i) {
-		if (get_client(outputs[i]) != client)
+		client = get_client(outputs[i]);
+		if (!client || client->session->active_window != wind)
 			continue;
 
+		// Since we have a client, we know this exists.
+		oud = wlc_handle_get_user_data(outputs[i]);
+		if (!oud->term_view)
+			continue;
+
+		found = false;
 		views = wlc_output_get_views(outputs[i], &vc);
-		for (int j = 0; j < vc; ++j)
+		for (int j = 0; j < vc; ++j) {
 			reposition_view(views[j]);
+			vud = wlc_handle_get_user_data(views[j]);
+			if (!vud || !vud->pane)
+				continue;
+			if (vud->pane->window != wind || !vud->pane->active)
+				continue;
+
+			found = true;
+		}
+		debug("found: %d", found);
+		if (!found)
+			wlc_view_focus(oud->term_view);
 	}
 
 	return 0;
@@ -751,7 +869,6 @@ static int tmux_session_window_changed(struct wtc_tmux *tmux,
 {
 	const wlc_handle *outputs, *views;
 	const struct wtc_tmux_client *client;
-	struct wtc_view *ud;
 	size_t opc, vc;
 
 	debug("Window changed: %p %u", sess, sess->id);
@@ -770,19 +887,42 @@ static int tmux_session_window_changed(struct wtc_tmux *tmux,
 	return 0;
 }
 
+static int tmux_client_session_changed(struct wtc_tmux *tmux,
+                                       const struct wtc_tmux_client *client)
+{
+	const wlc_handle *outputs, *views;
+	size_t opc, vc;
+
+	debug("Client moved: %p %s", client, client->name);
+
+	outputs = wlc_get_outputs(&opc);
+	for (int i = 0; i < opc; ++i) {
+		if (get_client(outputs[i]) != client)
+			continue;
+
+		views = wlc_output_get_views(outputs[i], &vc);
+		for (int j = 0; j < vc; ++j)
+			reposition_view(views[j]);
+	}
+
+	return 0;
+}
+
 static int setup_tmux_handlers(struct wtc_tmux *tmux)
 {
 	int r = 0;
 
-	r =         wtc_tmux_set_new_pane_cb(tmux, tmux_new_pane_cb);
-	r = r ? r : wtc_tmux_set_pane_closed_cb(tmux, tmux_pane_closed_cb);
-	r = r ? r : wtc_tmux_set_pane_resized_cb(tmux, tmux_pane_resized_cb);
+	r =         wtc_tmux_set_new_pane_cb(tmux, tmux_new_pane);
+	r = r ? r : wtc_tmux_set_pane_closed_cb(tmux, tmux_pane_closed);
+	r = r ? r : wtc_tmux_set_pane_resized_cb(tmux, tmux_pane_resized);
 	r = r ? r : wtc_tmux_set_pane_mode_changed_cb(tmux,
-	                                             tmux_pane_mode_changed_cb);
-	r = r ? r : wtc_tmux_set_client_session_changed_cb(tmux,
-	                                           tmux_client_session_changed);
+	                                             tmux_pane_mode_changed);
+	r = r ? r : wtc_tmux_set_window_pane_changed_cb(tmux,
+	                                            tmux_window_pane_changed);
 	r = r ? r : wtc_tmux_set_session_window_changed_cb(tmux,
 	                                           tmux_session_window_changed);
+	r = r ? r : wtc_tmux_set_client_session_changed_cb(tmux,
+	                                           tmux_client_session_changed);
 	return r;
 }
 

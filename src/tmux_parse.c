@@ -82,13 +82,15 @@ done:
 /*
  * Update the information on the sessions' status bar.
  */
-static int update_session_status(struct wtc_tmux *tmux,
-                                 struct wtc_tmux_session *sess,
-                                 bool gstatus, bool gstop)
+static int update_session_options(struct wtc_tmux *tmux,
+                                  struct wtc_tmux_session *sess,
+                                  bool gstatus, bool gstop,
+                                  key_code gprefix, key_code gprefix2)
 {
 	int r = 0;
 	char *out = NULL;
 	bool status, top;
+	key_code prefix, prefix2;
 
 	r = wtc_tmux_get_option(tmux, "status", sess->id,
 	                        WTC_TMUX_OPTION_SESSION, &out);
@@ -101,7 +103,7 @@ static int update_session_status(struct wtc_tmux *tmux,
 	} else if (strcmp(out, "") == 0) {
 		status = gstatus;
 	} else {
-		warn("update_session_status: Invalid status value: %s", out);
+		warn("update_session_options: Invalid status value: %s", out);
 		r = -EINVAL;
 		goto err_out;
 	}
@@ -118,14 +120,48 @@ static int update_session_status(struct wtc_tmux *tmux,
 	} else if (strcmp(out, "") == 0) {
 		top = gstop;
 	} else {
-		warn("update_session_status: Invalid status-position value: %s",
+		warn("update_session_options: Invalid status-position value: %s",
 		     out);
 		r = -EINVAL;
 		goto err_out;
 	}
 
+	free(out); out = NULL;
+	r = wtc_tmux_get_option(tmux, "prefix", sess->id,
+	                        WTC_TMUX_OPTION_SESSION, &out);
+	if (r)
+		goto err_out;
+	if (strcmp(out, "") == 0) {
+		prefix = gprefix;
+	} else {
+		prefix = key_string_lookup_string(out);
+		if (prefix == KEYC_UNKNOWN) {
+			warn("update_session_options: Invalid prefix value: %s", out);
+			r = -EINVAL;
+			goto err_out;
+		}
+	}
+
+	free(out); out = NULL;
+	r = wtc_tmux_get_option(tmux, "prefix2", sess->id,
+	                        WTC_TMUX_OPTION_SESSION, &out);
+	if (r)
+		goto err_out;
+	if (strcmp(out, "") == 0) {
+		prefix2 = gprefix2;
+	} else {
+		prefix2 = key_string_lookup_string(out);
+		if (prefix2 == KEYC_UNKNOWN) {
+			warn("update_session_options: Invalid prefix2 value: %s", out);
+			r = -EINVAL;
+			goto err_out;
+		}
+	}
+
 	sess->statusbar = !status ? WTC_TMUX_SESSION_OFF :
 	                   top ? WTC_TMUX_SESSION_TOP : WTC_TMUX_SESSION_BOTTOM;
+	sess->prefix = prefix;
+	sess->prefix2 = prefix2;
 
 err_out:
 	free(out);
@@ -317,6 +353,7 @@ int wtc_tmux_reload_panes(struct wtc_tmux *tmux)
 		pane->previous = NULL;
 		pane->next = NULL;
 		pane->window = NULL;
+		pane->active = false;
 
 		found = false;
 		for (int i = 0; i < count; ++i) {
@@ -426,6 +463,7 @@ int wtc_tmux_reload_panes(struct wtc_tmux *tmux)
 
 		if (active[i] && wind->active_pane != pane) {
 			wind->active_pane = pane;
+			pane->active = true;
 
 			cb.fid = WTC_TMUX_CB_WINDOW_PANE_CHANGED;
 			cb.tmux = tmux;
@@ -860,8 +898,8 @@ int wtc_tmux_reload_sessions(struct wtc_tmux *tmux)
 			goto err_sids;
 	}
 
-	bool gstatus = true;
-	bool gstop = true;
+	bool gstatus = true, gstop = true;
+	key_code gprefix = KEYC_NONE, gprefix2 = KEYC_NONE;
 	if (count) {
 		free(out); out = NULL;
 		r = wtc_tmux_get_option(tmux, "status", 0, WTC_TMUX_OPTION_GLOBAL |
@@ -895,12 +933,52 @@ int wtc_tmux_reload_sessions(struct wtc_tmux *tmux)
 			r = -EINVAL;
 			goto err_sids;
 		}
-	}
 
-	for (sess = tmux->sessions; sess; sess = sess->hh.next) {
-		r = update_session_status(tmux, sess, gstatus, gstop);
+		free(out); out = NULL;
+		r = wtc_tmux_get_option(tmux, "prefix", 0,
+		                        WTC_TMUX_OPTION_GLOBAL |
+		                        WTC_TMUX_OPTION_SESSION, &out);
 		if (r)
 			goto err_sids;
+		gprefix = key_string_lookup_string(out);
+		if (gprefix == KEYC_UNKNOWN) {
+			warn("wtc_tmux_reload_sessions: Invalid prefix value: %s", out);
+			r = -EINVAL;
+			goto err_sids;
+		}
+
+		free(out); out = NULL;
+		r = wtc_tmux_get_option(tmux, "prefix2", 0,
+		                        WTC_TMUX_OPTION_GLOBAL |
+		                        WTC_TMUX_OPTION_SESSION, &out);
+		if (r)
+			goto err_sids;
+		gprefix2 = key_string_lookup_string(out);
+		if (gprefix2 == KEYC_UNKNOWN) {
+			warn("wtc_tmux_reload_sessions: Invalid prefix2 value: %s",
+			     out);
+			r = -EINVAL;
+			goto err_sids;
+		}
+	}
+
+	// Update options and ensure a control client.
+	struct wtc_tmux_cc *cc;
+	for (sess = tmux->sessions; sess; sess = sess->hh.next) {
+		r = update_session_options(tmux, sess, gstatus, gstop,
+		                           gprefix, gprefix2);
+		if (r)
+			goto err_sids;
+
+		for (cc = tmux->ccs; cc; cc = cc->next)
+			if (cc->session == sess)
+				goto outer_cont;
+
+		r = wtc_tmux_cc_launch(tmux, sess);
+		if (r)
+			goto err_sids;
+
+	outer_cont: ;
 	}
 
 	r = wtc_tmux_reload_windows(tmux);
@@ -911,13 +989,14 @@ int wtc_tmux_reload_sessions(struct wtc_tmux *tmux)
 	if (r)
 		goto err_sids;
 
-	// If we have no sessions, start a temporary session.
-	if (!tmux->sessions)
-		r = wtc_tmux_cc_launch(tmux, NULL);
+	r = wtc_tmux_reload_key_binds(tmux);
 	if (r)
 		goto err_sids;
 
-	r = wtc_tmux_reload_key_binds(tmux);
+	// If we have no sessions, start a temporary session.
+	if (!tmux->sessions)
+		r = wtc_tmux_cc_launch(tmux, NULL);
+
 err_sids:
 	if (names) {
 		for (int i = 0; i < count; ++i)
@@ -1116,14 +1195,27 @@ int wtc_tmux_reload_key_binds(struct wtc_tmux *tmux)
 
 	int ll = 0;
 	key_code code;
+	char *start, *end;
 	bool repeat = false, in = false;
 	for (int i = 0; out[i]; ++i) {
 		if (out[i] == '\n') {
 			if (in && bind) {
-				// TODO parse next table (way easier than it sounds)
+				start = &out[i + (cmdp - ll)];
+				out[++i] = '\0';
+				free((void *) bind->cmd); bind->cmd = NULL;
+				bind->cmd = strdup(start);
+				if (!bind->cmd)
+					goto err_clean;
+
+				bind->table = table;
+				bind->repeat = repeat;
+				
+				// TODO Parse next table from bind->cmd
 				bind->next_table = root;
+				ll = 1;
+			} else {
+				ll = 0;
 			}
-			ll = 0;
 			repeat = false;
 			in = false;
 			bind = NULL;
@@ -1135,8 +1227,6 @@ int wtc_tmux_reload_key_binds(struct wtc_tmux *tmux)
 			repeat = out[i] == 'r';
 
 		if (ll == keyp) {
-			char *start, *end;
-
 			start = &out[i + (table_pos - ll)];
 			end = &out[i - 1];
 			while (*end == ' ') {
@@ -1155,8 +1245,6 @@ int wtc_tmux_reload_key_binds(struct wtc_tmux *tmux)
 			in = true;
 
 		if (in && out[i] == ' ' && ll < cmdp) {
-			char *start;
-
 			out[i] = '\0';
 			start = &out[i + (keyp - ll)];
 			code = key_string_lookup_string(start);
@@ -1167,59 +1255,12 @@ int wtc_tmux_reload_key_binds(struct wtc_tmux *tmux)
 				r = get_bind(table, code, &bind);
 				if (r < 0)
 					goto err_out;
-
-				bind->table = table;
-				bind->repeat = repeat;
 			}
 
 			in = false;
 		}
 
 		++ll;
-	}
-
-	// Handle prefixes.
-	struct wtc_tmux_key_table *prefix;
-	r = get_table(tmux, "prefix", &prefix);
-	if (r < 0)
-		goto err_clean;
-
-	free(out); out = NULL;
-	r = wtc_tmux_get_option(tmux, "prefix", 0, WTC_TMUX_OPTION_SERVER,
-	                        &out);
-	if (r < 0)
-		goto err_clean;
-
-	code = key_string_lookup_string(out);
-	if (code == KEYC_UNKNOWN) {
-		warn("wtc_tmux_reload_key_binds: Unknown key: %s", out);
-	} else if (code != KEYC_NONE) {
-		r = get_bind(table, code, &bind);
-		if (r < 0)
-			goto err_clean;
-
-		bind->repeat = false;
-		bind->table = root;
-		bind->next_table = prefix;
-	}
-
-	free(out); out = NULL;
-	r = wtc_tmux_get_option(tmux, "prefix2", 0, WTC_TMUX_OPTION_SERVER,
-	                        &out);
-	if (r < 0)
-		goto err_clean;
-
-	code = key_string_lookup_string(out);
-	if (code == KEYC_UNKNOWN) {
-		warn("wtc_tmux_reload_key_binds: Unknown key: %s", out);
-	} else if (code != KEYC_NONE) {
-		r = get_bind(table, code, &bind);
-		if (r < 0)
-			goto err_clean;
-
-		bind->repeat = false;
-		bind->table = root;
-		bind->next_table = prefix;
 	}
 
 err_clean: ;
@@ -1232,15 +1273,14 @@ err_clean: ;
 				continue;
 
 			HASH_DEL(table->binds, bind);
-			free(bind);
+			wtc_tmux_key_bind_free(bind);
 		}
 
 		if (table->binds)
 			continue;
 
 		HASH_DEL(tmux->tables, table);
-		free((void *) table->name);
-		free(table);
+		wtc_tmux_key_table_free(table);
 	}
 err_out:
 	free(out);
@@ -1316,13 +1356,13 @@ int wtc_tmux_refresh_cb(int fd, uint32_t mask, void *userdata)
 
 	assert(refresh == 0);
 
+	print_status(tmux);
+
 	for (size_t i = 0; i < tmux->closure_size; ++i) {
 		r = wtc_tmux_closure_invoke(&(tmux->closures[i]));
 		if (r)
 			break;
 	}
-
-	print_status(tmux);
 
 exit:
 	// If there's an error, ensure what we missed gets taken care of next

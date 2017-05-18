@@ -68,6 +68,24 @@ void wtc_tmux_client_free(struct wtc_tmux_client *client)
 	free(client);
 }
 
+void wtc_tmux_key_table_free(struct wtc_tmux_key_table *table)
+{
+	if (!table)
+		return;
+
+	free((void *) table->name);
+	free(table);
+}
+
+void wtc_tmux_key_bind_free(struct wtc_tmux_key_bind *bind)
+{
+	if (!bind)
+		return;
+
+	free((void *) bind->cmd);
+	free(bind);
+}
+
 static int sigc_cb(int fd, uint32_t mask, void *userdata)
 {
 	struct wtc_tmux *tmux = userdata;
@@ -624,12 +642,11 @@ void wtc_tmux_disconnect(struct wtc_tmux *tmux)
 	HASH_ITER(hh, tmux->tables, table, tmpt) {
 		HASH_ITER(hh, table->binds, bind, tmpb) {
 			HASH_DEL(table->binds, bind);
-			free(bind);
+			wtc_tmux_key_bind_free(bind);
 		}
 
 		HASH_DEL(tmux->tables, table);
-		free((void *)table->name);
-		free(table);
+		wtc_tmux_key_table_free(table);
 	}
 
 	tmux->connected = false;
@@ -973,4 +990,44 @@ void wtc_tmux_clear_closures(struct wtc_tmux *tmux)
 	}
 
 	tmux->closure_size = 0;
+}
+
+const struct wtc_tmux_client *
+wtc_tmux_lookup_client(const struct wtc_tmux *tmux, const char *name)
+{
+	struct wtc_tmux_client *res;
+	HASH_FIND(hh, tmux->clients, name, strlen(name), res);
+	return res;
+}
+
+const struct wtc_tmux_session *
+wtc_tmux_lookup_session(const struct wtc_tmux *tmux, int id)
+{
+	struct wtc_tmux_session *sess;
+	HASH_FIND_INT(tmux->sessions, &id, sess);
+	return sess;
+}
+
+const struct wtc_tmux_window *
+wtc_tmux_lookup_window(const struct wtc_tmux *tmux, int id)
+{
+	struct wtc_tmux_window *wind;
+	HASH_FIND_INT(tmux->windows, &id, wind);
+	return wind;
+}
+
+const struct wtc_tmux_pane *
+wtc_tmux_lookup_pane(const struct wtc_tmux *tmux, int id)
+{
+	struct wtc_tmux_pane *pane;
+	HASH_FIND_INT(tmux->panes, &id, pane);
+	return pane;
+}
+
+const struct wtc_tmux_key_table *
+wtc_tmux_lookup_key_table(const struct wtc_tmux *tmux, const char *name)
+{
+	struct wtc_tmux_key_table *tbl;
+	HASH_FIND(hh, tmux->tables, name, strlen(name), tbl);
+	return tbl;
 }

@@ -72,6 +72,7 @@ void wtc_tmux_cc_unref(struct wtc_tmux_cc *cc)
 
 // Hacky debug function.
 static void print_ring(struct shl_ring *ring) {
+	return;
 	int size = 0;
 	struct iovec pts[2];
 	size_t ivc = shl_ring_peek(ring, pts);
@@ -106,6 +107,7 @@ static int cc_cb(int fd, uint32_t mask, void *userdata)
 		if (mask & WL_EVENT_ERROR)
 			debug("cc_cb: Error: %d", fd);
 
+		wtc_tmux_queue_refresh(cc->tmux, WTC_TMUX_REFRESH_SESSIONS);
 		wlc_event_source_remove(cc->outs);
 		cc->outs = NULL;
 		wtc_tmux_cc_unref(cc);
@@ -416,66 +418,23 @@ static int exec_cc_cb(struct wtc_tmux_cc *cc, size_t start,
 	return 0;
 }
 
-int wtc_tmux_cc_exec(struct wtc_tmux_cc *cc, const char *const *cmds,
-                     char **out, char **err)
+static int wtc_tmux_cc_exec_str(struct wtc_tmux_cc *cc, const char *cmd,
+                                char **out, char **err)
 {
 	int r = 0;
 
-	if (!cc)
+	if (!cc || !cmd)
 		return -EINVAL;
 
-	// First, encode the command into a string.
-	int len = 0;
-	char *buf;
-	for (int i = 0; cmds[i]; ++i) {
-		len += 3; // space quote ... quote
-		for (int j = 0; cmds[i][j] != '\0'; ++j) {
-			if (cmds[i][j] == '"')
-				len += 2; // \"
-			else if (cmds[i][j] == '\n')
-				len += 2; // \n
-			else
-				++len;
-		}
-	}
+	debug("wtc_tmux_cc_exec_str: Command: %s", cmd);
 
-	buf = calloc(len + 1, sizeof(char)); // For terminating \0
-	if (!buf) {
-		crit("tmux_cc_exec: Couldn't allocate buf!");
-		return -ENOMEM;
-	}
-
-	int pos = 0;
-	for (int i = 0; cmds[i]; ++i) {
-		if (i != 0)
-			buf[pos++] = ' ';
-		buf[pos++] = '"';
-		for (int j = 0; cmds[i][j] != '\0'; ++j) {
-			if (cmds[i][j] == '"') {
-				buf[pos++] = '\\';
-				buf[pos++] = '"';
-			} else if (cmds[i][j] == '\n') {
-				buf[pos++] = '\\';
-				buf[pos++] = 'n';
-			} else {
-				buf[pos++] = cmds[i][j];
-			}
-		}
-		buf[pos++] = '"';
-	}
-	buf[pos++] = '\n';
-	buf[pos++] = '\0';
-
-	debug("wtc_tmux_cc_exec: Command: %s", buf);
-
-	pos = 0;
-	while (r = write(cc->fin, buf + pos, len - pos)) {
+	int pos = 0, len = strlen(cmd);
+	while (r = write(cc->fin, cmd + pos, len - pos)) {
 		if (r == -1) {
 			if (errno == EINTR)
 				continue;
-			warn("wtc_tmux_cc_exec: Error while writing: %d", errno);
-			r = -errno;
-			goto err_buf;
+			warn("wtc_tmux_cc_exec_str: Error while writing: %d", errno);
+			return -errno;
 		}
 
 		pos += r;
@@ -496,7 +455,8 @@ int wtc_tmux_cc_exec(struct wtc_tmux_cc *cc, const char *const *cmds,
 		if (r == -1) {
 			if (errno == EINTR)
 				continue;
-			warn("wtc_tmux_cc_exec: Error waiting for results: %d", errno);
+			warn("wtc_tmux_cc_exec_str: Error waiting for results: %d",
+			     errno);
 			r = -errno;
 			goto err_poll;
 		}
@@ -505,9 +465,9 @@ int wtc_tmux_cc_exec(struct wtc_tmux_cc *cc, const char *const *cmds,
 			mask |= WL_EVENT_READABLE;
 		if (pol.revents & (POLLHUP | POLLERR)) {
 			if (pol.revents & POLLHUP)
-				debug("wtc-tmux_cc_exec: HUP!");
+				debug("wtc_tmux_cc_exec_str: HUP!");
 			if (pol.revents & POLLERR)
-				debug("wtc-tmux_cc_exec: Error!");
+				debug("wtc_tmux_cc_exec_str: Error!");
 			r = -EIO;
 			goto err_poll;
 		}
@@ -521,9 +481,82 @@ int wtc_tmux_cc_exec(struct wtc_tmux_cc *cc, const char *const *cmds,
 err_poll:
 	cc->userdata = ud_bak;
 	cc->cmd_cb = cmd_bak;
-err_buf:
+	return r;
+}
+
+int wtc_tmux_cc_exec(struct wtc_tmux_cc *cc, const char *const *cmds,
+                     char **out, char **err)
+{
+	int len, pos;
+	char *buf;
+	int r = 0;
+
+	if (!cc)
+		return -EINVAL;
+
+	// First, encode the command into a string.
+	len = 0;
+	for (int i = 0; cmds[i]; ++i) {
+		len += 3; // space quote ... quote
+		for (int j = 0; cmds[i][j] != '\0'; ++j) {
+			if (cmds[i][j] == '"')
+				len += 2; // \"
+			else if (cmds[i][j] == '\n')
+				len += 2; // \n
+			else
+				++len;
+		}
+	}
+
+	buf = calloc(len + 1, sizeof(char)); // For terminating \0
+	if (!buf) {
+		crit("tmux_cc_exec: Couldn't allocate buf!");
+		return -ENOMEM;
+	}
+
+	pos = 0;
+	for (int i = 0; cmds[i]; ++i) {
+		if (i != 0)
+			buf[pos++] = ' ';
+		buf[pos++] = '"';
+		for (int j = 0; cmds[i][j] != '\0'; ++j) {
+			if (cmds[i][j] == '"') {
+				buf[pos++] = '\\';
+				buf[pos++] = '"';
+			} else if (cmds[i][j] == '\n') {
+				buf[pos++] = '\\';
+				buf[pos++] = 'n';
+			} else {
+				buf[pos++] = cmds[i][j];
+			}
+		}
+		buf[pos++] = '"';
+	}
+	buf[pos++] = '\n';
+	buf[pos++] = '\0';
+
+	r = wtc_tmux_cc_exec_str(cc, buf, out, err);
+
 	free(buf);
 	return r;
+}
+
+int wtc_tmux_session_exec(struct wtc_tmux *tmux,
+                          const struct wtc_tmux_session *sess,
+                          const char *text, char **out, char **err)
+{
+	struct wtc_tmux_cc *cc;
+	if (!tmux || !sess)
+		return -EINVAL;
+
+	for (cc = tmux->ccs; cc; cc = cc->next)
+		if (cc->session == sess)
+			break;
+
+	if (!cc)
+		return -EINVAL;
+
+	return wtc_tmux_cc_exec_str(cc, text, out, err);
 }
 
 int wtc_tmux_get_option(struct wtc_tmux *tmux, const char *name,

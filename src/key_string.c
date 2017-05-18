@@ -39,6 +39,7 @@
 #include <strings.h>
 #include <sys/types.h>
 #include <wchar.h>
+#include <xkbcommon/xkbcommon-keysyms.h>
 
 typedef unsigned char u_char;
 typedef unsigned int u_int;
@@ -382,5 +383,94 @@ utf8_combine(const struct utf8_data *ud, wchar_t *wc)
 		return (UTF8_ERROR);
 	default:
 		return (UTF8_DONE);
+	}
+}
+
+key_code key_code_from_xkb_key_char(uint32_t key, uint32_t chr)
+{
+	// I wish there was a better way :(
+	switch (key) {
+	case XKB_KEY_BackSpace:
+		return KEYC_BSPACE;
+
+	case XKB_KEY_F1:
+		return KEYC_F1;
+	case XKB_KEY_F2:
+		return KEYC_F2;
+	case XKB_KEY_F3:
+		return KEYC_F3;
+	case XKB_KEY_F4:
+		return KEYC_F4;
+	case XKB_KEY_F5:
+		return KEYC_F5;
+	case XKB_KEY_F6:
+		return KEYC_F6;
+	case XKB_KEY_F7:
+		return KEYC_F7;
+	case XKB_KEY_F8:
+		return KEYC_F8;
+	case XKB_KEY_F9:
+		return KEYC_F9;
+	case XKB_KEY_F10:
+		return KEYC_F10;
+	case XKB_KEY_F11:
+		return KEYC_F11;
+	case XKB_KEY_F12:
+		return KEYC_F12;
+	case XKB_KEY_Insert:
+		return KEYC_IC;
+	case XKB_KEY_Home:
+		return KEYC_HOME;
+	case XKB_KEY_End:
+		return KEYC_END;
+	case XKB_KEY_Page_Down:
+		return KEYC_NPAGE;
+	case XKB_KEY_Page_Up:
+		return KEYC_PPAGE;
+	case XKB_KEY_BackTab:
+		return KEYC_BTAB;
+
+	case XKB_KEY_Up:
+		return KEYC_UP;
+	case XKB_KEY_Down:
+		return KEYC_DOWN;
+	case XKB_KEY_Left:
+		return KEYC_LEFT;
+	case XKB_KEY_Right:
+		return KEYC_RIGHT;
+
+	case XKB_KEY_KP_Divide:
+		return KEYC_KP_SLASH;
+	case XKB_KEY_KP_Multiply:
+		return KEYC_KP_STAR;
+	case XKB_KEY_KP_Subtract:
+		return KEYC_KP_MINUS;
+	case XKB_KEY_KP_7:
+		return KEYC_KP_SEVEN;
+	case XKB_KEY_KP_8:
+		return KEYC_KP_EIGHT;
+	case XKB_KEY_KP_9:
+		return KEYC_KP_NINE;
+	case XKB_KEY_KP_4:
+		return KEYC_KP_FOUR;
+	case XKB_KEY_KP_5:
+		return KEYC_KP_FIVE;
+	case XKB_KEY_KP_6:
+		return KEYC_KP_SIX;
+	case XKB_KEY_KP_1:
+		return KEYC_KP_ONE;
+	case XKB_KEY_KP_2:
+		return KEYC_KP_TWO;
+	case XKB_KEY_KP_3:
+		return KEYC_KP_THREE;
+	case XKB_KEY_KP_0:
+		return KEYC_KP_ZERO;
+	case XKB_KEY_KP_Decimal:
+		return KEYC_KP_PERIOD;
+
+	default:
+		if (chr)
+			return chr;
+		return KEYC_UNKNOWN;
 	}
 }

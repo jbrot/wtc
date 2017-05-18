@@ -182,6 +182,8 @@ void wtc_tmux_pane_free(struct wtc_tmux_pane *pane);
 void wtc_tmux_window_free(struct wtc_tmux_window *window);
 void wtc_tmux_session_free(struct wtc_tmux_session *sess);
 void wtc_tmux_client_free(struct wtc_tmux_client *client);
+void wtc_tmux_key_table_free(struct wtc_tmux_key_table *table);
+void wtc_tmux_key_bind_free(struct wtc_tmux_key_bind *bind);
 
 /*
  * A specialized version of waitpid that will, after the timeout value in
