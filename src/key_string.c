@@ -470,7 +470,7 @@ key_code key_code_from_xkb_key_char(uint32_t key, uint32_t chr)
 
 	default:
 		if (chr)
-			return chr;
+			return chr == 0x08 ? KEYC_BSPACE : chr;
 		return KEYC_UNKNOWN;
 	}
 }

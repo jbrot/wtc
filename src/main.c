@@ -551,6 +551,12 @@ bool wlc_kbd(wlc_handle view, uint32_t time,
 	if (code == KEYC_NONE || code == KEYC_UNKNOWN)
 		return false;
 
+	if (mods->mods & WLC_BIT_MOD_ALT)
+		code |= KEYC_ESCAPE;
+
+	// 104 - 8
+	info("KEY: %c - %u - %u", chr, sym, code);
+
 	HASH_FIND(hh, table->binds, &code, sizeof(code), bind);
 	if (bind) {
 		if (set_table_name(ud, bind->next_table->name))
@@ -705,6 +711,42 @@ static void reposition_view(wlc_handle view)
 		wlc_view_focus(view);
 }
 
+static void reposition_output(wlc_handle output)
+{
+	const wlc_handle *views;
+	const struct wtc_tmux_client *client;
+	struct wtc_output *oud;
+	struct wtc_view *vud;
+	size_t vc;
+	bool found;
+
+	client = get_client(output);
+	if (!client)
+		return;
+
+	// Since we have a client, we know this exists.
+	oud = wlc_handle_get_user_data(output);
+	if (!oud->term_view)
+		return;
+
+	found = false;
+	views = wlc_output_get_views(output, &vc);
+	for (int i = 0; i < vc; ++i) {
+		reposition_view(views[i]);
+		vud = wlc_handle_get_user_data(views[i]);
+		if (!vud || !vud->pane)
+			continue;
+		if (vud->pane->window != client->session->active_window ||
+		    !vud->pane->active)
+			continue;
+
+		// N.B. This counts an error as visible.
+		found = is_visible(views[i]);
+	}
+	if (!found)
+		wlc_view_focus(oud->term_view);
+}
+
 static int tmux_new_pane(struct wtc_tmux *tmux, 
                          const struct wtc_tmux_pane *pane)
 {
@@ -768,27 +810,14 @@ static int tmux_pane_closed(struct wtc_tmux *tmux,
 static int tmux_pane_resized(struct wtc_tmux *tmux, 
                              const struct wtc_tmux_pane *pane)
 {
-	const wlc_handle *outputs, *views;
-	struct wtc_view *ud;
-	size_t opc, vc;
+	const wlc_handle *outputs;
+	size_t opc;
 
 	debug("Pane resized: %p %u", pane, pane->id);
 
 	outputs = wlc_get_outputs(&opc);
-	for (int i = 0; i < opc; ++i) {
-		views = wlc_output_get_views(outputs[i], &vc);
-		for (int j = 0; j < vc; ++j) {
-			ud = wlc_handle_get_user_data(views[j]);
-			if (!ud)
-				continue;
-
-			if (ud->pane != pane)
-				continue;
-
-			reposition_view(views[j]);
-			return 0;
-		}
-	}
+	for (int i = 0; i < opc; ++i)
+		reposition_output(outputs[i]);
 
 	return 0;
 }
@@ -796,27 +825,14 @@ static int tmux_pane_resized(struct wtc_tmux *tmux,
 static int tmux_pane_mode_changed(struct wtc_tmux *tmux, 
                                   const struct wtc_tmux_pane *pane)
 {
-	const wlc_handle *outputs, *views;
-	struct wtc_view *ud;
-	size_t opc, vc;
+	const wlc_handle *outputs;
+	size_t opc;
 
 	debug("Pane changed mode: %p %u", pane, pane->id);
 
 	outputs = wlc_get_outputs(&opc);
-	for (int i = 0; i < opc; ++i) {
-		views = wlc_output_get_views(outputs[i], &vc);
-		for (int j = 0; j < vc; ++j) {
-			ud = wlc_handle_get_user_data(views[j]);
-			if (!ud)
-				continue;
-
-			if (ud->pane != pane)
-				continue;
-
-			reposition_view(views[j]);
-			return 0;
-		}
-	}
+	for (int i = 0; i < opc; ++i)
+		reposition_output(outputs[i]);
 
 	return 0;
 }
@@ -824,42 +840,14 @@ static int tmux_pane_mode_changed(struct wtc_tmux *tmux,
 static int tmux_window_pane_changed(struct wtc_tmux *tmux,
                                        const struct wtc_tmux_window *wind)
 {
-	const wlc_handle *outputs, *views;
-	const struct wtc_tmux_client *client;
-	struct wtc_output *oud;
-	struct wtc_view *vud;
-	size_t opc, vc;
-	bool found;
+	const wlc_handle *outputs;
+	size_t opc;
 
 	debug("Pane changed: %p %u", wind, wind->id);
 
 	outputs = wlc_get_outputs(&opc);
-	for (int i = 0; i < opc; ++i) {
-		client = get_client(outputs[i]);
-		if (!client || client->session->active_window != wind)
-			continue;
-
-		// Since we have a client, we know this exists.
-		oud = wlc_handle_get_user_data(outputs[i]);
-		if (!oud->term_view)
-			continue;
-
-		found = false;
-		views = wlc_output_get_views(outputs[i], &vc);
-		for (int j = 0; j < vc; ++j) {
-			reposition_view(views[j]);
-			vud = wlc_handle_get_user_data(views[j]);
-			if (!vud || !vud->pane)
-				continue;
-			if (vud->pane->window != wind || !vud->pane->active)
-				continue;
-
-			found = true;
-		}
-		debug("found: %d", found);
-		if (!found)
-			wlc_view_focus(oud->term_view);
-	}
+	for (int i = 0; i < opc; ++i)
+		reposition_output(outputs[i]);
 
 	return 0;
 }
@@ -867,22 +855,14 @@ static int tmux_window_pane_changed(struct wtc_tmux *tmux,
 static int tmux_session_window_changed(struct wtc_tmux *tmux,
                                        const struct wtc_tmux_session *sess)
 {
-	const wlc_handle *outputs, *views;
-	const struct wtc_tmux_client *client;
-	size_t opc, vc;
+	const wlc_handle *outputs;
+	size_t opc;
 
 	debug("Window changed: %p %u", sess, sess->id);
 
 	outputs = wlc_get_outputs(&opc);
-	for (int i = 0; i < opc; ++i) {
-		client = get_client(outputs[i]);
-		if (!client || client->session != sess)
-			continue;
-
-		views = wlc_output_get_views(outputs[i], &vc);
-		for (int j = 0; j < vc; ++j)
-			reposition_view(views[j]);
-	}
+	for (int i = 0; i < opc; ++i)
+		reposition_output(outputs[i]);
 
 	return 0;
 }
@@ -890,20 +870,14 @@ static int tmux_session_window_changed(struct wtc_tmux *tmux,
 static int tmux_client_session_changed(struct wtc_tmux *tmux,
                                        const struct wtc_tmux_client *client)
 {
-	const wlc_handle *outputs, *views;
-	size_t opc, vc;
+	const wlc_handle *outputs;
+	size_t opc;
 
 	debug("Client moved: %p %s", client, client->name);
 
 	outputs = wlc_get_outputs(&opc);
-	for (int i = 0; i < opc; ++i) {
-		if (get_client(outputs[i]) != client)
-			continue;
-
-		views = wlc_output_get_views(outputs[i], &vc);
-		for (int j = 0; j < vc; ++j)
-			reposition_view(views[j]);
-	}
+	for (int i = 0; i < opc; ++i)
+		reposition_output(outputs[i]);
 
 	return 0;
 }
